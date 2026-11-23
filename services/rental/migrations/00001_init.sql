@@ -11,6 +11,7 @@ CREATE TABLE offers (
     deposit bigint NOT NULL CHECK (deposit >= 0),
     user_profile_fallback_used boolean NOT NULL,
     status text NOT NULL CHECK (status IN ('AVAILABLE', 'CONSUMED')),
+    created_at timestamptz NOT NULL,
     expires_at timestamptz NOT NULL
 );
 -- EXPIRED is derived from expires_at for offers that are still AVAILABLE.
@@ -31,11 +32,15 @@ CREATE TABLE orders (
     finish_time timestamptz,
     closed_at timestamptz,
     delete_after timestamptz,
-    cost bigint CHECK (cost >= 0)
+    cost bigint CHECK (cost >= 0),
+    CHECK ((status IN ('START_FAILED', 'COMPLETED', 'CANCELLED')) =
+           (closed_at IS NOT NULL AND delete_after IS NOT NULL AND cost IS NOT NULL))
 );
+-- At most one STARTING or ACTIVE order per scooter.
 CREATE UNIQUE INDEX orders_occupied_scooter ON orders (scooter_id)
     WHERE status IN ('STARTING', 'ACTIVE');
-CREATE INDEX orders_retention ON orders (delete_after) WHERE delete_after IS NOT NULL;
+-- Candidates for archiving: closed orders, oldest first.
+CREATE INDEX orders_closed ON orders (closed_at) WHERE closed_at IS NOT NULL;
 
 CREATE TABLE tasks (
     task_id uuid PRIMARY KEY,
@@ -54,18 +59,19 @@ CREATE TABLE tasks (
     next_run_at timestamptz NOT NULL,
     lease_until timestamptz,
     deadline_at timestamptz,
-    hold_expires_at timestamptz,
     last_error text,
     UNIQUE (order_id, task_type),
     CHECK ((claim_id IS NULL) = (lease_until IS NULL)),
     CHECK ((deadline_at IS NOT NULL) = (task_type = 'START')),
-    CHECK ((hold_expires_at IS NOT NULL) = (task_type = 'START'))
+    CHECK ((status = 'COMPLETED') = (finished_at IS NOT NULL))
 );
 CREATE INDEX tasks_ready ON tasks (next_run_at, task_id) WHERE status = 'PENDING';
 CREATE INDEX tasks_start_deadline ON tasks (deadline_at, task_id)
     WHERE task_type = 'START' AND status = 'PENDING';
 CREATE INDEX tasks_completed ON tasks (finished_at, task_id) WHERE status = 'COMPLETED';
 
+-- Weekly partitions named orders_history_pYYYYMMDD (Monday, UTC) are managed by maintenance.
+-- There is no default partition: DETACH PARTITION CONCURRENTLY does not allow one.
 CREATE TABLE orders_history (
     order_id uuid NOT NULL,
     offer_id uuid NOT NULL,
@@ -75,30 +81,27 @@ CREATE TABLE orders_history (
     minute_rate bigint NOT NULL,
     unlock_fee bigint NOT NULL,
     deposit bigint NOT NULL,
-    user_profile_fallback_used boolean NOT NULL,
     status text NOT NULL CHECK (status IN ('START_FAILED', 'COMPLETED', 'CANCELLED')),
     created_at timestamptz NOT NULL,
     started_at timestamptz,
     finish_time timestamptz,
     closed_at timestamptz NOT NULL,
     delete_after timestamptz NOT NULL,
-    cost bigint NOT NULL
+    cost bigint NOT NULL,
+    user_profile_fallback_used boolean NOT NULL
 ) PARTITION BY RANGE (delete_after);
 CREATE INDEX orders_history_by_order ON orders_history (order_id);
 CREATE INDEX orders_history_by_offer ON orders_history (offer_id);
 CREATE INDEX orders_history_retention ON orders_history (delete_after);
 
--- +goose StatementBegin
-CREATE FUNCTION rental_trip_cost(minute_rate bigint, unlock_fee bigint, elapsed interval)
-RETURNS bigint LANGUAGE sql IMMUTABLE STRICT AS $$
-    SELECT CASE WHEN elapsed < interval '5 seconds' THEN 0
-        ELSE unlock_fee + floor(floor(extract(epoch FROM elapsed)) * minute_rate / 60)::bigint
-    END;
-$$;
--- +goose StatementEnd
+CREATE TABLE maintenance_leases (
+    name text PRIMARY KEY,
+    holder uuid NOT NULL,
+    lease_until timestamptz NOT NULL
+);
 
 -- +goose Down
-DROP FUNCTION rental_trip_cost(bigint, bigint, interval);
+DROP TABLE maintenance_leases;
 DROP TABLE orders_history;
 DROP TABLE tasks;
 DROP TABLE orders;

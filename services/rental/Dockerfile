@@ -3,14 +3,12 @@ WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-ENV CGO_ENABLED=0
-RUN go build -trimpath -o /service ./cmd/api
-RUN go build -trimpath -o /worker ./cmd/worker
-RUN go build -trimpath -o /maintenance ./cmd/maintenance
+RUN CGO_ENABLED=0 go build -trimpath -o /rental ./cmd/rental
 
 FROM alpine:3.23
 RUN adduser -D -H app
-COPY --from=build /service /worker /maintenance /usr/local/bin/
+COPY --from=build /rental /usr/local/bin/rental
 USER app
 EXPOSE 8080
-ENTRYPOINT ["/usr/local/bin/service"]
+ENTRYPOINT ["/usr/local/bin/rental"]
+CMD ["api"]

@@ -1,0 +1,27 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+# dns_sd_configs resolves every replica of a Compose service.
+scrape_configs:
+  - job_name: rental-api
+    dns_sd_configs:
+      - names: [rental-api]
+        type: A
+        port: 8080
+  - job_name: rental-worker
+    dns_sd_configs:
+      - names: [rental-worker]
+        type: A
+        port: 8080
+  - job_name: rental-maintenance
+    dns_sd_configs:
+      - names: [rental-maintenance]
+        type: A
+        port: 8080
+  - job_name: source
+    static_configs:
+      - targets: ["source:8080"]
+  - job_name: payment
+    static_configs:
+      - targets: ["payment:8080"]
