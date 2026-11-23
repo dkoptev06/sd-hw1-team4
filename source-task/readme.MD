@@ -1,18 +1,3 @@
-# Стенд аренды самокатов
-
-Rental, Source и Payment имеют отдельные Go-модули и Dockerfile в каталоге `services/`. Корневой `go.work` позволяет работать со всеми тремя модулями. Rental владеет миграциями PostgreSQL в `services/rental/migrations/`. Контракты сервисов описаны в [ADR](../docs/ADR.md) и [EXTERNAL_SERVICES.md](../docs/EXTERNAL_SERVICES.md).
-
-```sh
-docker compose build rental source payment
-docker compose up -d rental source payment
-```
-
-Rental использует порт 18080, Source — 18081, Payment — 18082. У каждого сервиса есть `/healthz` и `/metrics`, у Rental также `/readyz`. Compose применяет миграции перед запуском Rental API. Предметные маршруты из ADR зарегистрированы и пока возвращают `501 NOT_IMPLEMENTED`.
-
-Образ Rental содержит три точки входа из `cmd/api`, `cmd/worker` и `cmd/maintenance`. В Compose запускается API. Циклы обработки задач и очистки остаются TODO своих срезов.
-
-Для проверки Go-модулей и интеграционных тестов используйте [план проверок](../docs/agent-loop/validation.md).
-
 ## Начальная реализация домашнего задания
 
 Данная реализация не выполняет требования по Maintainability, Reliability, Scalability.
