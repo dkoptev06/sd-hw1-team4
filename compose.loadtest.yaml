@@ -1,0 +1,7 @@
+# Add the emulator to the application's network without changing core services.
+services:
+  loadtest:
+    profiles: [loadtest]
+    build:
+      context: ./services/rental
+      dockerfile: Dockerfile.loadtest
