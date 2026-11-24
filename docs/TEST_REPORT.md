@@ -1,6 +1,6 @@
 # Отчёт о нагрузочном и функциональном тестировании Rental
 
-**Ревизия:** `a608c5c765c0d37f633671162d54c8cb7102e5e5` (ветка `codex/loadtest`) · **Дата:** 24 ноября 2026  
+**Дата:** 24 ноября 2026
 **Стенд:** `kukuka-win` (Ryzen 9 5950X, Ubuntu WSL2, Docker 29.1.3 / Compose 2.40.3, жёсткие лимиты cgroup v2)  
 **Документы:** [TEST_PLAN.md](TEST_PLAN.md) · [RESOURCE_BUDGET.md](RESOURCE_BUDGET.md) · [EMULATOR_SCENARIOS.md](EMULATOR_SCENARIOS.md) · [ADR.md](ADR.md)
 
@@ -46,7 +46,7 @@
 
 ## 2. Стенд и ограничения ресурсов
 
-На `kukuka-win` сервисы Rental и PostgreSQL работали под жёсткими лимитами Linux cgroup v2 (`compose.loadtest.acceptance.yaml`):
+На `kukuka-win` сервисы Rental и PostgreSQL работали под жёсткими лимитами Linux cgroup v2.
 
 | Сервис | Реплики | Лимит cgroup (CPU / RAM) | Ключевые настройки |
 | --- | ---: | ---: | --- |
