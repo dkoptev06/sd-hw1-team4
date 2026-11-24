@@ -46,6 +46,9 @@ services/rental/internal/
 | `make test-functional` | Функциональные сценарии из тест-плана через HTTP на отдельной схеме PostgreSQL |
 | `make up` / `make down` | Собрать и поднять / остановить весь стенд |
 | `make logs` | Логи процессов Rental |
+| `make loadtest` | Эмулятор на поднятом стенде: 100 поездок/с, 50 GET на поездку, 7 мин разогрева и 30 мин замеров. Параметры задаются переменными `LOADTEST_*` (см. Makefile). Отчёт — в `build/loadtest.json`, сводка печатается в терминал |
+| `make loadtest-demo` | Короткий профиль для демонстрации, около 5,5 мин; отчёт в `build/loadtest-demo.json` |
+| `make loadtest-history-ids` | Выгрузить ID архивных заказов в `build/history.ids`. С `LOADTEST_HISTORY=build/history.ids` 15 из 50 GET идут в архив |
 
 Интеграционные тесты создают собственную схему и удаляют её после себя. Без `RENTAL_TEST_DATABASE_URL` они пропускаются.
 
@@ -59,7 +62,7 @@ services/rental/internal/
 | Source | http://localhost:18081 |
 | Payment | http://localhost:18082 |
 | Prometheus | http://localhost:19090 |
-| Grafana (анонимный доступ) | http://localhost:13000 |
+| Grafana (анонимный доступ, домашняя страница — дашборд «Rental — демо защиты») | http://localhost:13000 |
 | PostgreSQL | `postgres://rental:rental@localhost:55432/rental` |
 
 Число реплик задают `RENTAL_API_REPLICAS` и `RENTAL_WORKER_REPLICAS` (по умолчанию 2). Source по умолчанию содержит `scooter-1…scooter-40000` в четырёх зонах `zone-1…zone-4` и `user-1…user-40000`; объёмы меняют `SOURCE_SCOOTERS` и `SOURCE_USERS`.
