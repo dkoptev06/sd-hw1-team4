@@ -28,17 +28,31 @@ func TestActiveQuoteIsAttainableDuringActualRequest(t *testing.T) {
 		{15 * time.Second, 15*time.Second + time.Millisecond, 0, false},
 		{-time.Second, -time.Millisecond, 0, false}, // start is in the future
 	} {
-		if got := q.liveCost(tc.cost, start, start.Add(tc.lo), start.Add(tc.hi)); got != tc.valid {
+		if got := q.liveCost(tc.cost, start, start.Add(tc.lo), start.Add(tc.hi), time.Microsecond); got != tc.valid {
 			t.Errorf("interval %v..%v with cost %d accepted=%t", tc.lo, tc.hi, tc.cost, got)
 		}
+	}
+	// With configurable clock skew, a 100ms host-vs-DB drift across a second boundary is accepted.
+	sent, recv := start.Add(5*time.Second+50*time.Millisecond), start.Add(5*time.Second+70*time.Millisecond)
+	if q.liveCost(0, start, sent, recv, time.Microsecond) {
+		t.Fatal("cost from 4s accepted under 1us skew at 5.05s")
+	}
+	if !q.liveCost(0, start, sent, recv, 100*time.Millisecond) {
+		t.Fatal("cost from 4s rejected under 100ms skew at 5.05s")
 	}
 }
 
 func TestQuoteFieldsAndExactFinalPrice(t *testing.T) {
-	offer := response{MinuteRate: amount(17), UnlockFee: amount(50), Deposit: amount(0)}
+	exp := time.Now().UTC().Add(2 * time.Minute)
+	offer := response{MinuteRate: amount(17), UnlockFee: amount(50), Deposit: amount(0), ExpiresAt: &exp}
 	q, ok := quoteFor(offer)
 	if !ok {
 		t.Fatal("valid response rejected")
+	}
+	noExp := offer
+	noExp.ExpiresAt = nil
+	if _, ok := quoteFor(noExp); ok {
+		t.Fatal("missing expires_at accepted")
 	}
 	offer.MinuteRate = nil
 	if _, ok := quoteFor(offer); ok {
@@ -78,20 +92,28 @@ func TestStartingAmountAndImportedHistory(t *testing.T) {
 	q := &quotedTrip{minuteRate: 17}
 	for _, body := range []string{`{"order_id":"a","status":"STARTING"}`, `{"order_id":"a","status":"STARTING","cost":null}`} {
 		var v response
-		if err := json.Unmarshal([]byte(body), &v); err != nil || !validView(v, "a", q, now, now) {
+		if err := json.Unmarshal([]byte(body), &v); err != nil || !validView(v, "a", q, now, now, time.Microsecond) {
 			t.Fatalf("%s %v", body, err)
 		}
 	}
-	if validView(response{OrderID: "a", Status: "STARTING", Cost: amount(0)}, "a", q, now, now) {
+	if validView(response{OrderID: "a", Status: "STARTING", Cost: amount(0)}, "a", q, now, now, time.Microsecond) {
 		t.Fatal("numeric STARTING price accepted")
 	}
 	start := now.Add(-2 * time.Minute)
 	v := response{OrderID: "a", Status: "COMPLETED", StartedAt: &start, FinishTime: &now, Cost: amount(123456)}
-	if !validView(v, "a", nil, now, now) {
+	if !validView(v, "a", nil, now, now, time.Microsecond) {
 		t.Fatal("arbitrary historical offer wrongly compared to current terms")
 	}
-	if validView(v, "a", q, now, now) {
+	if validView(v, "a", q, now, now, time.Microsecond) {
 		t.Fatal("wrong completed current price accepted")
+	}
+	// Historical CANCELLED and START_FAILED views are also valid archived responses.
+	shortEnd := start.Add(2 * time.Second)
+	if !validView(response{OrderID: "c", Status: "CANCELLED", StartedAt: &start, FinishTime: &shortEnd, Cost: amount(0)}, "c", nil, now, now, time.Microsecond) {
+		t.Fatal("valid archived CANCELLED rejected")
+	}
+	if !validView(response{OrderID: "f", Status: "START_FAILED", Cost: amount(0)}, "f", nil, now, now, time.Microsecond) {
+		t.Fatal("valid archived START_FAILED rejected")
 	}
 }
 

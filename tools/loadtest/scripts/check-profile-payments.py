@@ -5,6 +5,7 @@ from collections import Counter
 import hashlib
 import http.client
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -31,19 +32,41 @@ SELECT json_build_object(
 """
 
 
-def compose(*args, stdin=None):
-    return subprocess.check_output(["docker", "compose", *args], cwd=ROOT, input=stdin, text=True).strip()
+def compose(*args, project=None, stdin=None):
+    cmd = ["docker", "compose"]
+    if project:
+        cmd += ["-p", project]
+    return subprocess.check_output([*cmd, *args], cwd=ROOT, input=stdin, text=True).strip()
 
 
-def verify(path, sample_size):
+def fetch_payment_status(conn, host, port, order_id):
+    """Fetch GET /payment/{order_id}, reconnecting once on an idle keep-alive close."""
+    for attempt in range(2):
+        try:
+            conn.request("GET", "/payment/" + order_id)
+            reply = conn.getresponse()
+            body = reply.read()
+            return conn, reply.status, body
+        except (http.client.RemoteDisconnected, http.client.BadStatusLine):
+            conn.close()
+            if attempt == 1:
+                raise
+            conn = http.client.HTTPConnection(host, port, timeout=5)
+    raise AssertionError("unreachable")
+
+
+def verify(path, sample_size, project_override=None):
     profile = json.loads(path.read_text())
+    project = project_override or profile.get("project")
     run_id = str(UUID(profile["run_id"]))
     win_from, win_to = profile["window_from"], profile["window_to"]
     expected_count = profile["database"]["created_in_window"]
-    sample = json.loads(compose("exec", "-T", "postgres", "psql", "-XqAt", "-U", "rental", "-d", "rental",
-                                "-v", "ON_ERROR_STOP=1", "-v", "run_id=" + run_id,
-                                "-v", "win_from=" + win_from, "-v", "win_to=" + win_to,
-                                "-v", f"sample_size={sample_size}", stdin=SAMPLE_SQL))
+    sample = json.loads(compose(
+        "exec", "-T", "postgres", "psql", "-XqAt", "-U", "rental", "-d", "rental",
+        "-v", "ON_ERROR_STOP=1", "-v", "run_id=" + run_id,
+        "-v", "win_from=" + win_from, "-v", "win_to=" + win_to,
+        "-v", f"sample_size={sample_size}", project=project, stdin=SAMPLE_SQL,
+    ))
     ids = [str(UUID(value)) for value in sample.pop("ids")]
     errors = []
     if sample["window_orders"] != expected_count:
@@ -56,18 +79,16 @@ def verify(path, sample_size):
     mismatches = []
     if not errors:
         # Resolve the published port for this specific Compose project.
-        target = urlsplit("//" + compose("port", "payment", "8080"))
+        target = urlsplit("//" + compose("port", "payment", "8080", project=project))
         host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(target.hostname, target.hostname)
         if not host or target.port is None:
             raise ValueError("the Payment service has no published HTTP port")
         conn = http.client.HTTPConnection(host, target.port, timeout=5)
         try:
             for order_id in ids:
-                conn.request("GET", "/payment/" + order_id)
-                reply = conn.getresponse()
-                body = reply.read()
-                status = f"HTTP_{reply.status}"
-                if reply.status == 200:
+                conn, http_status, body = fetch_payment_status(conn, host, target.port, order_id)
+                status = f"HTTP_{http_status}"
+                if http_status == 200:
                     try:
                         result = json.loads(body)
                         if not isinstance(result, dict) or not isinstance(result.get("status"), str):
@@ -82,16 +103,23 @@ def verify(path, sample_size):
             errors.append(f"GET /payment/{order_id}: {err}")
         finally:
             conn.close()
-    return {"profile": path.name, "run_id": run_id, "window_from": win_from, "window_to": win_to,
-            **sample, "requested_sample": sample_size, "checked": sum(statuses.values()),
-            "sample_ids_sha256": hashlib.sha256(("\n".join(ids) + "\n").encode()).hexdigest(),
-            "payment_status_counts": dict(statuses), "mismatch_examples": mismatches, "errors": errors,
-            "pass": not errors and statuses["PAID"] == sample_size}
+    return {
+        "profile": path.name, "project": project, "run_id": run_id, "window_from": win_from, "window_to": win_to,
+        **sample, "requested_sample": sample_size, "checked": sum(statuses.values()),
+        "sample_ids_sha256": hashlib.sha256(("\n".join(ids) + "\n").encode()).hexdigest(),
+        "payment_status_counts": dict(statuses), "mismatch_examples": mismatches, "errors": errors,
+        "pass": not errors and statuses["PAID"] == sample_size,
+    }
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("profiles", type=Path, nargs="+", help="JSON output from run-profile.py")
+    parser.add_argument(
+        "--project",
+        default=os.environ.get("COMPOSE_PROJECT_NAME"),
+        help="Docker Compose project override (defaults to COMPOSE_PROJECT_NAME or each profile's project)",
+    )
     parser.add_argument("--sample-size", type=int, default=1000, help="distinct order IDs per profile (default 1000)")
     args = parser.parse_args()
     if args.sample_size < 1:
@@ -99,7 +127,7 @@ def main():
     reports = []
     for path in args.profiles:
         try:
-            reports.append(verify(path, args.sample_size))
+            reports.append(verify(path, args.sample_size, project_override=args.project))
         except (OSError, ValueError, KeyError, subprocess.SubprocessError) as err:
             reports.append({"profile": path.name, "pass": False, "error": str(err)})
     passed = all(r["pass"] for r in reports)

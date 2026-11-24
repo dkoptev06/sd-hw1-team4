@@ -17,7 +17,9 @@ type quotedTrip struct {
 }
 
 func quoteFor(offer response) (*quotedTrip, bool) {
-	if offer.MinuteRate == nil || offer.UnlockFee == nil || offer.Deposit == nil || *offer.MinuteRate < 0 || *offer.UnlockFee < 0 || *offer.Deposit < 0 {
+	if offer.MinuteRate == nil || offer.UnlockFee == nil || offer.Deposit == nil ||
+		offer.ExpiresAt == nil || offer.ExpiresAt.IsZero() ||
+		*offer.MinuteRate < 0 || *offer.UnlockFee < 0 || *offer.Deposit < 0 {
 		return nil, false
 	}
 	return &quotedTrip{minuteRate: *offer.MinuteRate, unlockFee: *offer.UnlockFee}, true
@@ -48,15 +50,19 @@ func (q *quotedTrip) observeStarted(at *time.Time) bool {
 	return q.started.Load().Equal(*at)
 }
 
-// The driver and PostgreSQL share the Compose host clock. DB timestamps have
-// microsecond precision. A valid cost must be attainable at some whole second
-// between the actual HTTP send and receive, including the five-second boundary.
-func (q *quotedTrip) liveCost(cost int64, start, sent, received time.Time) bool {
-	if cost < 0 || start.After(received.Add(time.Microsecond)) {
+// By default the driver and PostgreSQL share the Compose host clock (DB
+// timestamps have microsecond precision). Optional skew allows cross-host runs.
+// A valid cost must be attainable at some whole second between the actual HTTP
+// send and receive, including the five-second boundary.
+func (q *quotedTrip) liveCost(cost int64, start, sent, received time.Time, skew time.Duration) bool {
+	if skew < 0 {
+		skew = 0
+	}
+	if cost < 0 || start.After(received.Add(skew)) {
 		return false
 	}
-	lo := max(int64(0), int64(sent.Add(-time.Microsecond).Sub(start)/time.Second))
-	hi := int64(received.Add(time.Microsecond).Sub(start) / time.Second)
+	lo := max(int64(0), int64(sent.Add(-skew).Sub(start)/time.Second))
+	hi := int64(received.Add(skew).Sub(start) / time.Second)
 	for lo <= hi {
 		mid := lo + (hi-lo)/2
 		value, ok := q.bill(mid)
@@ -90,7 +96,7 @@ func validFinal(v response, start time.Time, q *quotedTrip) bool {
 	return ok && *v.Cost == cost
 }
 
-func validView(v response, id string, q *quotedTrip, sent, received time.Time) bool {
+func validView(v response, id string, q *quotedTrip, sent, received time.Time, skew time.Duration) bool {
 	if v.OrderID != id {
 		return false
 	}
@@ -101,7 +107,7 @@ func validView(v response, id string, q *quotedTrip, sent, received time.Time) b
 		return q == nil && v.Cost != nil && *v.Cost == 0 && v.StartedAt == nil && v.FinishTime == nil
 	case "ACTIVE":
 		return q != nil && v.StartedAt != nil && v.FinishTime == nil && v.Cost != nil &&
-			q.liveCost(*v.Cost, *v.StartedAt, sent, received) && q.observeStarted(v.StartedAt)
+			q.liveCost(*v.Cost, *v.StartedAt, sent, received, skew) && q.observeStarted(v.StartedAt)
 	case "COMPLETED", "CANCELLED":
 		return v.StartedAt != nil && validFinal(v, *v.StartedAt, q) && (q == nil || q.observeStarted(v.StartedAt))
 	default:

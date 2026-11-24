@@ -2,11 +2,13 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"math/rand/v2"
 	"net/http"
 	"os"
@@ -21,7 +23,7 @@ import (
 type options struct {
 	url, historyFile                                       string
 	rate, reads, historical, fleet, concurrency, queueSize int
-	warmup, duration, minRide, maxRide                     time.Duration
+	warmup, duration, minRide, maxRide, clockSkew          time.Duration
 	seed                                                   int64
 }
 
@@ -33,6 +35,7 @@ type response struct {
 	MinuteRate *int64     `json:"minute_rate"`
 	UnlockFee  *int64     `json:"unlock_fee"`
 	Deposit    *int64     `json:"deposit"`
+	ExpiresAt  *time.Time `json:"expires_at"`
 	StartedAt  *time.Time `json:"started_at"`
 	FinishTime *time.Time `json:"finish_time"`
 	ErrorCode  string     `json:"error_code"`
@@ -43,8 +46,8 @@ type run struct {
 	client                        *http.Client
 	runID                         string
 	start, from, to               time.Time
-	history                       []string
-	fleet                         chan int
+	history                       []uuid.UUID
+	fleet                         *fleetPool
 	queue                         *readQueue
 	rides, readers                sync.WaitGroup
 	mu                            sync.Mutex
@@ -56,31 +59,41 @@ type run struct {
 	unresolved                    []incomplete
 }
 
+func (r *run) clockSkew() time.Duration {
+	if r.opts.clockSkew > 0 {
+		return r.opts.clockSkew
+	}
+	return time.Microsecond
+}
+
 func (r *run) record(name string, due time.Time, outcome string) {
 	r.recordAt(name, due, time.Now(), outcome)
 }
 
 func (r *run) recordAt(name string, due, end time.Time, outcome string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if outcome != "ok" {
-		r.failures[name+"/"+outcome]++
-	}
-	route := r.stats[name]
+	s := r.stats[name]
+	s.mu.Lock()
 	if outcome != "generator_saturated" && outcome != "fleet_exhausted" {
-		route.totalSent++
+		s.totalSent++
 	}
 	if outcome == "ok" {
-		route.totalValid++
-		if name == "finish" {
-			r.finished++
-		}
+		s.totalValid++
 	}
 	if !end.Before(r.from) && end.Before(r.to) {
-		route.latencies = append(route.latencies, end.Sub(due))
+		s.latencies = append(s.latencies, end.Sub(due))
 		if outcome == "ok" {
-			route.success++
+			s.success++
 		}
+	}
+	s.mu.Unlock()
+	if outcome != "ok" || name == "finish" {
+		r.mu.Lock()
+		if outcome != "ok" {
+			r.failures[name+"/"+outcome]++
+		} else {
+			r.finished++
+		}
+		r.mu.Unlock()
 	}
 }
 
@@ -116,9 +129,13 @@ func (r *run) request(method, path string, body any, expected ...int) (response,
 }
 
 // Each ride owns its scooter and user until a successful finish. Ambiguous
-// outcomes quarantine the pair for the rest of this run.
-func (r *run) trip(n, id int, due time.Time, ride time.Duration) {
-	b := map[string]string{"user_id": fmt.Sprintf("user-%d", id), "scooter_id": fmt.Sprintf("scooter-%d", id), "idempotency_id": fmt.Sprintf("%s-%d", r.runID, n)}
+// outcomes quarantine both IDs for the rest of this run.
+func (r *run) trip(n, scooterID, userID int, due time.Time, ride time.Duration) {
+	b := map[string]string{
+		"user_id":        fmt.Sprintf("user-%d", userID),
+		"scooter_id":     fmt.Sprintf("scooter-%d", scooterID),
+		"idempotency_id": fmt.Sprintf("%s-%d", r.runID, n),
+	}
 	offer, outcome := r.request("POST", "/offers", b, http.StatusCreated)
 	if outcome == "ok" && offer.OfferID == "" {
 		outcome = "missing_id"
@@ -129,7 +146,7 @@ func (r *run) trip(n, id int, due time.Time, ride time.Duration) {
 	}
 	r.record("offer", due, outcome)
 	if outcome != "ok" {
-		r.fleet <- id
+		r.fleet.release(scooterID, userID)
 		return
 	}
 	started := time.Now()
@@ -140,7 +157,7 @@ func (r *run) trip(n, id int, due time.Time, ride time.Duration) {
 	r.record("start", started, outcome)
 	if outcome != "ok" {
 		if ambiguousStart(outcome) {
-			r.remember(incomplete{offer: offer.OfferID})
+			r.remember(incomplete{offer: offer.OfferID, offerExpires: offer.ExpiresAt})
 		}
 		return
 	}
@@ -156,7 +173,7 @@ func (r *run) trip(n, id int, due time.Time, ride time.Duration) {
 		readDue := accepted.Add(ride * time.Duration(2*i+1) / time.Duration(2*r.opts.reads))
 		time.Sleep(time.Until(readDue))
 		if (i+1)*r.opts.historical/r.opts.reads > i*r.opts.historical/r.opts.reads {
-			histID := r.history[random.IntN(len(r.history))]
+			histID := r.history[random.IntN(len(r.history))].String()
 			if r.read("/orders/"+histID, "get_history", histID, readDue, nil) {
 				sentHistory++
 			}
@@ -184,7 +201,7 @@ func (r *run) trip(n, id int, due time.Time, ride time.Duration) {
 			r.mu.Lock()
 			r.audits = append(r.audits, finishAudit{quote, closed, finishDue, end})
 			r.mu.Unlock()
-			r.fleet <- id
+			r.fleet.release(scooterID, userID)
 			return
 		} else if !validFinal(closed, *start, quote) {
 			outcome = "invalid_finish_cost"
@@ -195,14 +212,25 @@ func (r *run) trip(n, id int, due time.Time, ride time.Duration) {
 		r.remember(incomplete{order: order.OrderID})
 		return
 	}
-	r.fleet <- id
+	r.fleet.release(scooterID, userID)
 }
 
 type route struct {
+	mu                    sync.Mutex
 	totalSent, totalValid int
 	success               int
 	latencies             []time.Duration
 }
+
+func (s *route) validCount() int {
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.totalValid
+}
+
 type routeSummary struct {
 	Success  int     `json:"success"`
 	Attempts int     `json:"attempts"`
@@ -210,7 +238,7 @@ type routeSummary struct {
 	P95MS    float64 `json:"p95_ms"`
 }
 
-func (s route) summarize(window time.Duration) routeSummary {
+func (s *route) summarize(window time.Duration) routeSummary {
 	var p95 time.Duration
 	if n := len(s.latencies); n > 0 {
 		slices.Sort(s.latencies)
@@ -219,38 +247,89 @@ func (s route) summarize(window time.Duration) routeSummary {
 	return routeSummary{s.success, len(s.latencies), float64(s.success) / window.Seconds(), float64(p95) / float64(time.Millisecond)}
 }
 
+func loadHistoryIDs(path string) ([]uuid.UUID, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	scanner.Split(bufio.ScanWords)
+	var ids []uuid.UUID
+	for scanner.Scan() {
+		id, err := uuid.Parse(scanner.Text())
+		if err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	if len(ids) == 0 {
+		return nil, fmt.Errorf("empty historical ID list")
+	}
+	return ids, nil
+}
+
+func preallocLatencies(rps int, window time.Duration) []time.Duration {
+	if rps <= 0 || window <= 0 {
+		return nil
+	}
+	const maxPrealloc = 12_000_000
+	est := int(math.Ceil(float64(rps) * window.Seconds() * 1.05))
+	if est > maxPrealloc {
+		est = maxPrealloc
+	}
+	if est <= 0 {
+		return nil
+	}
+	return make([]time.Duration, 0, est)
+}
+
 func simulate(o options) (bool, error) {
-	if o.rate < 1 || o.reads < 1 || o.fleet < 1 || o.concurrency < 1 || o.queueSize < 1 || o.warmup < 0 || o.duration <= 0 || o.minRide <= 0 || o.maxRide < o.minRide || o.historical < 0 || o.historical > o.reads {
+	if o.rate < 1 || o.reads < 1 || o.fleet < 1 || o.concurrency < 1 || o.queueSize < 1 || o.warmup < 0 || o.duration <= 0 || o.minRide <= 0 || o.maxRide < o.minRide || o.historical < 0 || o.historical > o.reads || o.clockSkew < 0 {
 		return false, fmt.Errorf("invalid load profile")
 	}
-	r := &run{opts: o, runID: uuid.NewString(), fleet: make(chan int, o.fleet), stats: map[string]*route{}, failures: map[string]int{}}
+	if o.concurrency > maxReadWorkers {
+		return false, fmt.Errorf("read-concurrency %d exceeds maximum %d", o.concurrency, maxReadWorkers)
+	}
+	if o.historical == 0 && o.historyFile != "" {
+		return false, fmt.Errorf("-history-file requires -historical > 0")
+	}
+	if o.historical > 0 && o.historyFile == "" {
+		return false, fmt.Errorf("-historical > 0 requires -history-file")
+	}
+	r := &run{
+		opts:     o,
+		runID:    uuid.NewString(),
+		fleet:    newFleetPool(o.fleet, o.seed),
+		stats:    map[string]*route{},
+		failures: map[string]int{},
+	}
 	if o.historical > 0 {
-		data, err := os.ReadFile(o.historyFile)
+		ids, err := loadHistoryIDs(o.historyFile)
 		if err != nil {
 			return false, err
 		}
-		r.history = strings.Fields(string(data))
-		if len(r.history) == 0 {
-			return false, fmt.Errorf("empty historical ID list")
-		}
-		for _, id := range r.history {
-			if _, err = uuid.Parse(id); err != nil {
-				return false, err
-			}
-		}
+		r.history = ids
 	}
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	// GET workers share this transport with offer/start/finish. Keep enough
 	// idle sockets for both streams; admission of new trips remains independent.
-	tr.MaxIdleConnsPerHost = min(o.concurrency, maxReadWorkers) + 128
+	tr.MaxIdleConnsPerHost = o.concurrency + max(256, o.rate*4)
 	tr.MaxIdleConns = tr.MaxIdleConnsPerHost
 	r.client = &http.Client{Timeout: 5 * time.Second, Transport: tr, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	defer tr.CloseIdleConnections()
-	for i := 1; i <= o.fleet; i++ {
-		r.fleet <- i
+	targets := map[string]int{
+		"offer":       o.rate,
+		"start":       o.rate,
+		"finish":      o.rate,
+		"get_current": o.rate * (o.reads - o.historical),
+		"get_history": o.rate * o.historical,
 	}
-	for _, name := range []string{"offer", "start", "get_current", "get_history", "finish"} {
-		r.stats[name] = &route{}
+	for name, rps := range targets {
+		r.stats[name] = &route{latencies: preallocLatencies(rps, o.duration)}
 	}
 	r.startReads(o.concurrency, o.queueSize)
 	random := rand.New(rand.NewPCG(uint64(o.seed), 0))
@@ -267,10 +346,9 @@ func simulate(o options) (bool, error) {
 		time.Sleep(time.Until(due))
 		r.scheduled++
 		ride := o.minRide + time.Duration(random.Int64N(int64(o.maxRide-o.minRide)+1))
-		select {
-		case id := <-r.fleet:
-			r.rides.Go(func() { r.trip(n, id, due, ride) })
-		default:
+		if scooterID, userID, ok := r.fleet.acquire(); ok {
+			r.rides.Go(func() { r.trip(n, scooterID, userID, due, ride) })
+		} else {
 			r.record("offer", due, "fleet_exhausted")
 		}
 	}
@@ -287,6 +365,7 @@ func simulate(o options) (bool, error) {
 	result := map[string]any{
 		"run_id": r.runID, "start": r.start.UTC(), "window_from": r.from.UTC(), "window_to": r.to.UTC(), "drain_seconds": time.Since(r.to).Seconds(),
 		"rate": o.rate, "reads_per_ride": o.reads, "historical_reads_per_ride": o.historical, "history_ids": len(r.history), "fleet": o.fleet, "seed": o.seed,
+		"clock_skew_ms": float64(r.clockSkew()) / float64(time.Millisecond),
 		"min_ride_seconds": o.minRide.Seconds(), "max_ride_seconds": o.maxRide.Seconds(), "scheduled_trips": r.scheduled,
 		"accepted_trips": r.accepted, "primary_gets": getTotals, "rides_with_wrong_get_distribution": r.mismatchedRides,
 		"read_queue": r.queue.stats, "primary_gets_pass": readPass, "post_drain_finish_audit_gets": auditGETs,
@@ -294,10 +373,10 @@ func simulate(o options) (bool, error) {
 	}
 	// The steady-state RPS tolerance is specified by docs/TEST_PLAN.md.
 	pass := readPass && len(r.failures) == 0 && r.finished == r.scheduled
-	for name, target := range map[string]int{"offer": o.rate, "start": o.rate, "finish": o.rate, "get_current": o.rate * (o.reads - o.historical), "get_history": o.rate * o.historical} {
+	limits := map[string]float64{"offer": 1000, "start": 2000, "finish": 2000, "get_current": 300, "get_history": 300}
+	for name, target := range targets {
 		route := routes[name]
-		limit := map[string]float64{"offer": 1000, "start": 2000, "finish": 2000, "get_current": 300, "get_history": 300}[name]
-		if target > 0 && (route.RPS < float64(target)*0.95 || route.RPS > float64(target)*1.05 || route.P95MS > limit) {
+		if target > 0 && (route.RPS < float64(target)*0.95 || route.RPS > float64(target)*1.05 || route.P95MS > limits[name]) {
 			pass = false
 		}
 	}
@@ -318,10 +397,11 @@ func main() {
 	flag.DurationVar(&o.warmup, "warmup", 7*time.Minute, "unmeasured ramp-up")
 	flag.DurationVar(&o.minRide, "min-ride", 4*time.Minute, "minimum ride duration")
 	flag.DurationVar(&o.maxRide, "max-ride", 6*time.Minute, "maximum ride duration")
-	flag.IntVar(&o.fleet, "fleet", 40000, "number of pairs seeded by Source")
-	flag.IntVar(&o.concurrency, "read-concurrency", 512, "GET network workers (capped at 1024)")
+	flag.IntVar(&o.fleet, "fleet", 40000, "number of scooters and users seeded by Source")
+	flag.IntVar(&o.concurrency, "read-concurrency", 1536, "GET network workers (max 4096)")
 	flag.IntVar(&o.queueSize, "read-queue", 32768, "maximum queued primary GETs before an explicit generator_saturated failure")
-	flag.Int64Var(&o.seed, "seed", 4, "trip duration and historical selection seed")
+	flag.DurationVar(&o.clockSkew, "clock-skew", time.Microsecond, "clock skew tolerance between driver and PostgreSQL for active cost checks")
+	flag.Int64Var(&o.seed, "seed", 4, "trip duration, user pairing, and historical selection seed")
 	flag.Parse()
 	o.url = strings.TrimRight(o.url, "/")
 	pass, err := simulate(o)

@@ -8,7 +8,11 @@ import (
 	"time"
 )
 
-type incomplete struct{ offer, order string }
+type incomplete struct {
+	offer        string
+	order        string
+	offerExpires *time.Time
+}
 
 func ambiguousStart(outcome string) bool {
 	return outcome == "transport" || outcome == "invalid_json" || outcome == "invalid_start" || strings.HasPrefix(outcome, "5") || strings.HasPrefix(outcome, "unexpected_http_")
@@ -33,7 +37,17 @@ func (r *run) reconcile() int {
 	close(queue)
 	var done atomic.Int64
 	var workers sync.WaitGroup
-	deadline := time.Now().Add(2 * time.Minute)
+	now := time.Now()
+	deadline := now.Add(2 * time.Minute)
+	maxDeadline := now.Add(4 * time.Minute)
+	for _, trip := range r.unresolved {
+		if trip.order == "" && trip.offerExpires != nil {
+			needed := trip.offerExpires.Add(30 * time.Second)
+			if needed.After(deadline) {
+				deadline = minTime(needed, maxDeadline)
+			}
+		}
+	}
 	for range min(16, len(r.unresolved)) {
 		workers.Go(func() {
 			for trip := range queue {
@@ -52,6 +66,18 @@ func (r *run) reconcile() int {
 
 func (r *run) closeTrip(trip incomplete, deadline time.Time) bool {
 	if trip.order == "" {
+		// Wait past offer expiration before replaying POST /orders so an
+		// unconsumed offer returns 409 OFFER_EXPIRED instead of creating a new
+		// order after drain, while an already-created order still replays 200 OK.
+		if trip.offerExpires != nil {
+			waitUntil := minTime(trip.offerExpires.Add(100*time.Millisecond), deadline)
+			if wait := time.Until(waitUntil); wait > 0 {
+				time.Sleep(wait)
+			}
+			if !time.Now().Before(deadline) {
+				return false
+			}
+		}
 		replay, outcome := r.request("POST", "/orders", map[string]string{"offer_id": trip.offer}, http.StatusOK, http.StatusAccepted)
 		if outcome != "ok" || replay.OrderID == "" {
 			return false
@@ -74,4 +100,11 @@ func (r *run) closeTrip(trip incomplete, deadline time.Time) bool {
 		time.Sleep(250 * time.Millisecond)
 	}
 	return false
+}
+
+func minTime(a, b time.Time) time.Time {
+	if a.Before(b) {
+		return a
+	}
+	return b
 }

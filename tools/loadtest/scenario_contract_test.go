@@ -34,6 +34,7 @@ func TestLoadtestScenarioChild(t *testing.T) {
 
 type scenarioRide struct {
 	scooter string
+	user    string
 	started time.Time
 	ended   *time.Time
 	reads   int
@@ -55,16 +56,18 @@ func TestLoadtestScenarioContract(t *testing.T) {
 			var mu sync.Mutex
 			offers := make(map[string]*scenarioRide)
 			orders := make(map[string]*scenarioRide)
-			occupied := make(map[string]bool)
+			occupiedScooters := make(map[string]bool)
+			occupiedUsers := make(map[string]bool)
 			idempotency := make(map[string]bool)
 			secondArrival := make(chan struct{})
 			var archiveReads int
-			archive := map[string]bool{
-				"eeead460-8e70-5d56-af1b-a441a271c024": true,
-				"912ba484-caf1-5a00-9b0d-446400cdfec7": true,
+			archive := map[string]string{
+				"eeead460-8e70-5d56-af1b-a441a271c024": "COMPLETED",
+				"912ba484-caf1-5a00-9b0d-446400cdfec7": "CANCELLED",
+				"35b79f8b-4a34-5d0a-92f4-179066941cf2": "START_FAILED",
 			}
 			historyFile := filepath.Join(t.TempDir(), "history.ids")
-			if err := os.WriteFile(historyFile, []byte("eeead460-8e70-5d56-af1b-a441a271c024\n912ba484-caf1-5a00-9b0d-446400cdfec7\n"), 0600); err != nil {
+			if err := os.WriteFile(historyFile, []byte("eeead460-8e70-5d56-af1b-a441a271c024\n912ba484-caf1-5a00-9b0d-446400cdfec7\n35b79f8b-4a34-5d0a-92f4-179066941cf2\n"), 0600); err != nil {
 				t.Fatal(err)
 			}
 
@@ -85,18 +88,22 @@ func TestLoadtestScenarioContract(t *testing.T) {
 				}
 				mu.Lock()
 				scooter, user, key := body["scooter_id"], body["user_id"], body["idempotency_id"]
-				index, ok := strings.CutPrefix(scooter, "scooter-")
-				pair, err := strconv.Atoi(index)
-				if !ok || err != nil || pair < 1 || pair > fleet || user != "user-"+index || occupied[scooter] || key == "" || idempotency[key] {
+				sIdx, sOK := strings.CutPrefix(scooter, "scooter-")
+				uIdx, uOK := strings.CutPrefix(user, "user-")
+				sNum, sErr := strconv.Atoi(sIdx)
+				uNum, uErr := strconv.Atoi(uIdx)
+				if !sOK || !uOK || sErr != nil || uErr != nil || sNum < 1 || sNum > fleet || uNum < 1 || uNum > fleet ||
+					occupiedScooters[scooter] || occupiedUsers[user] || key == "" || idempotency[key] {
 					mu.Unlock()
-					t.Errorf("invalid fleet or idempotency assignment for %q", scooter)
+					t.Errorf("invalid fleet or idempotency assignment for %q / %q", scooter, user)
 					w.WriteHeader(409)
 					return
 				}
 				idempotency[key] = true
-				occupied[scooter] = true
+				occupiedScooters[scooter] = true
+				occupiedUsers[user] = true
 				id := uuid.NewString()
-				offers[id] = &scenarioRide{scooter: scooter}
+				offers[id] = &scenarioRide{scooter: scooter, user: user}
 				ordinal := len(offers)
 				mu.Unlock()
 				switch ordinal {
@@ -113,7 +120,10 @@ func TestLoadtestScenarioContract(t *testing.T) {
 				case 2:
 					close(secondArrival)
 				}
-				respond(w, 201, map[string]any{"offer_id": id, "minute_rate": 60, "unlock_fee": 10, "deposit": 200})
+				respond(w, 201, map[string]any{
+					"offer_id": id, "minute_rate": 60, "unlock_fee": 10, "deposit": 200,
+					"expires_at": time.Now().UTC().Add(2 * time.Minute),
+				})
 			})
 			mux.HandleFunc("POST /orders", func(w http.ResponseWriter, req *http.Request) {
 				var body map[string]string
@@ -139,15 +149,24 @@ func TestLoadtestScenarioContract(t *testing.T) {
 				mu.Lock()
 				defer mu.Unlock()
 				id := req.PathValue("id")
-				if archive[id] {
+				if status, ok := archive[id]; ok {
 					archiveReads++
 					if tc.breakHistory {
 						respond(w, 503, map[string]string{"error_code": "FIXTURE_UNAVAILABLE"})
 						return
 					}
 					end := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
-					respond(w, 200, map[string]any{"order_id": id, "status": "COMPLETED", "cost": 130,
-						"started_at": end.Add(-2 * time.Minute), "finish_time": end})
+					switch status {
+					case "COMPLETED":
+						respond(w, 200, map[string]any{"order_id": id, "status": "COMPLETED", "cost": 130,
+							"started_at": end.Add(-2 * time.Minute), "finish_time": end})
+					case "CANCELLED":
+						respond(w, 200, map[string]any{"order_id": id, "status": "CANCELLED", "cost": 0,
+							"started_at": end.Add(-2 * time.Second), "finish_time": end})
+					case "START_FAILED":
+						respond(w, 200, map[string]any{"order_id": id, "status": "START_FAILED", "cost": 0,
+							"started_at": nil, "finish_time": nil})
+					}
 					return
 				}
 				ride, ok := orders[id]
@@ -176,7 +195,8 @@ func TestLoadtestScenarioContract(t *testing.T) {
 				}
 				at := time.Now()
 				ride.ended = &at
-				delete(occupied, ride.scooter)
+				delete(occupiedScooters, ride.scooter)
+				delete(occupiedUsers, ride.user)
 				respond(w, 200, map[string]any{"order_id": id, "status": "COMPLETED",
 					"cost": 10 + int64(at.Sub(ride.started)/time.Second), "finish_time": at})
 			})
@@ -237,8 +257,9 @@ func TestLoadtestScenarioContract(t *testing.T) {
 			}
 			mu.Lock()
 			defer mu.Unlock()
-			if len(orders) != scheduled || len(occupied) != 0 || archiveReads != history {
-				t.Fatalf("fixture observed orders=%d occupied=%d archiveReads=%d", len(orders), len(occupied), archiveReads)
+			if len(orders) != scheduled || len(occupiedScooters) != 0 || len(occupiedUsers) != 0 || archiveReads != history {
+				t.Fatalf("fixture observed orders=%d occupiedScooters=%d occupiedUsers=%d archiveReads=%d",
+					len(orders), len(occupiedScooters), len(occupiedUsers), archiveReads)
 			}
 			for id, ride := range orders {
 				if ride.ended == nil || ride.reads != 50-tc.history {

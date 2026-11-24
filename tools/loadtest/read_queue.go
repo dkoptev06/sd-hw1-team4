@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-const maxReadWorkers = 1024
+const maxReadWorkers = 4096
 
 type scheduledRead struct {
 	path, route, id string
@@ -96,7 +96,7 @@ func (r *run) readWorker() {
 		}
 		view, result := r.request("GET", req.path, nil, http.StatusOK)
 		end := time.Now()
-		if result == "ok" && !validView(view, req.id, req.quote, sent, end) {
+		if result == "ok" && !validView(view, req.id, req.quote, sent, end, r.clockSkew()) {
 			result = "invalid_order"
 		}
 		r.recordAt(req.route, req.due, end, result)
@@ -137,10 +137,8 @@ func (r *run) writeReadProgress(w io.Writer) {
 	q := r.queue
 	q.mu.Lock()
 	stats, depth := q.stats, q.size
-	r.mu.Lock()
-	valid := r.stats["get_current"].totalValid + r.stats["get_history"].totalValid
-	r.mu.Unlock()
 	q.mu.Unlock()
+	valid := r.stats["get_current"].validCount() + r.stats["get_history"].validCount()
 	fmt.Fprintf(w, "%s GET queue=%d/%d peak=%d overflows=%d sent=%d validated=%d max_dispatch_delay_ms=%.1f\n",
 		time.Now().UTC().Format(time.RFC3339), depth, stats.Capacity, stats.PeakQueued, stats.Overflows, stats.Dispatched, valid, stats.MaxDispatchDelayMS)
 }

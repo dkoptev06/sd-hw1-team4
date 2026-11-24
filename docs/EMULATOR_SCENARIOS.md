@@ -7,23 +7,24 @@
 | Сценарий | Запросы | Исходные данные |
 | --- | --- | --- |
 | Базовый | 100 новых поездок в секунду и 50 GET своего заказа на поездку | Пустая БД Rental, стандартный Source с 40 000 самокатов и пользователей |
-| Смешанный | 100 новых поездок в секунду, 35 GET своего заказа и 15 GET случайного заказа из архива на поездку | 53 000 завершённых заказов примерно по 1 КБ в 53 недельных разделах. По желанию добавляется полностью просроченный раздел для проверки очистки. |
+| Смешанный | 100 новых поездок в секунду, 35 GET своего заказа и 15 GET случайного заказа из архива на поездку | Завершённые архивные заказы примерно по 1 КБ в 53 недельных разделах (`--history-count 53000` по умолчанию или `--target-mib 700+`, чтобы превысить `shared_buffers = 512MB`). По желанию добавляется полностью просроченный раздел для проверки очистки. |
 
-Оба сценария по умолчанию используют 7 минут разминки, 30 минут измерения и завершение оставшихся поездок. Эмулятор отправляет заявки независимо от ответа на предыдущие и учитывает опоздания, ошибки и переполнение очереди. План требует стабилизации RPS и очереди перед началом замера. Эмулятор начинает окно по таймеру, поэтому перед использованием результата для приёмки отдельно проверьте поминутные метрики начала окна.
+Оба сценария по умолчанию используют 7 минут разминки, 30 минут измерения и завершение оставшихся поездок. Эмулятор отправляет заявки независимо от ответа на предыдущие и учитывает опоздания, ошибки и переполнение очереди (по умолчанию `-read-concurrency 1536`, максимум `4096`). План требует стабилизации RPS и очереди перед началом замера. Эмулятор начинает окно по таймеру, поэтому перед использованием результата для приёмки отдельно проверьте поминутные метрики начала окна (например, через `export-window.py --pre-minutes 1`).
 
-Эмулятор использует обычные `scooter-N` и `user-N`. Размер около 1 КБ относится к подготовленным архивным строкам. Размер фактических заказов измеряется после прогона в `database.mean_order_row_bytes_in_window`. Основная ветка физически удаляет полностью просроченные недельные разделы. Для проверки этой операции можно подготовить отдельный истёкший раздел, чьи UUID не попадают в список для GET.
+Эмулятор независимо назначает `scooter-N` и `user-M` так, чтобы на одного пользователя и один самокат приходилось не более одной активной поездки, а все комбинации зоны, подписки и `trusted` покрывались равномерно. Размер около 1 КБ относится к подготовленным архивным строкам (смесь `COMPLETED`, `CANCELLED` и `START_FAILED` с тарифами четырёх зон). Размер фактических заказов измеряется после прогона в `database.mean_order_row_bytes_in_window`. Основная ветка физически удаляет полностью просроченные недельные разделы. Для проверки этой операции можно подготовить отдельный истёкший раздел, чьи UUID не попадают в список для GET.
 
 ## Проверка логики отдельно от стенда
 
 ```sh
-(cd tools/loadtest && GOWORK=off go test -race ./...)
+(cd tools/loadtest && GOWORK=off go vet ./... && GOWORK=off go test -race ./...)
+python3 -m unittest -v tools/loadtest/scripts/test_scripts.py
 ```
 
-Автотесты запускают CLI и проверяют счётчики HTTP на тестовом сервере. Базовый сценарий создаёт 30 поездок с 1 500 текущими GET. Смешанный создаёт 30 поездок с 1 050 текущими и 450 архивными GET. Отдельная проверка возвращает 503 на архивный GET и требует, чтобы все 450 ошибок попали в JSON, а CLI вернул код 1.
+Автотесты запускают CLI и проверяют счётчики HTTP на тестовом сервере. Базовый сценарий создаёт 30 поездок с 1 500 текущими GET. Смешанный создаёт 30 поездок с 1 050 текущими и 450 архивными GET (включая `COMPLETED`, `CANCELLED` и `START_FAILED`). Отдельная проверка возвращает 503 на архивный GET и требует, чтобы все 450 ошибок попали в JSON, а CLI вернул код 1.
 
 ## Запуск на сервисах основной ветки
 
-Используйте отдельный проект Compose с пустой БД для каждого сценария. При параллельном запуске задайте разные хостовые порты для обоих проектов. Каждый блок запуска выполняется из корня репозитория. Для повторного импорта данных используйте новый путь для файла UUID.
+Используйте отдельный проект Compose с пустой БД для каждого сценария. При параллельном запуске задайте разные хостовые порты для обоих проектов. Все скрипты принимают `--project` (или используют `COMPOSE_PROJECT_NAME`). Каждый блок запуска выполняется из корня репозитория. Для повторного импорта данных используйте новый путь для файла UUID.
 
 **Базовый профиль**
 
@@ -31,8 +32,8 @@
 export COMPOSE_PROJECT_NAME=baseline-lab
 make up
 python3 tools/loadtest/scripts/prepare-emulator-data.py baseline --project "$COMPOSE_PROJECT_NAME"
-python3 tools/loadtest/scripts/run-profile.py --out build/baseline.json
-python3 tools/loadtest/scripts/check-profile-payments.py build/baseline.json > build/baseline-payments.json
+python3 tools/loadtest/scripts/run-profile.py --project "$COMPOSE_PROJECT_NAME" --out build/baseline.json
+python3 tools/loadtest/scripts/check-profile-payments.py --project "$COMPOSE_PROJECT_NAME" build/baseline.json > build/baseline-payments.json
 ```
 
 **Смешанный профиль**
@@ -42,15 +43,16 @@ export COMPOSE_PROJECT_NAME=mixed-lab
 docker compose up -d --build --wait nginx rental-worker prometheus
 python3 tools/loadtest/scripts/prepare-emulator-data.py mixed --project "$COMPOSE_PROJECT_NAME" \
   --ids build/mixed-history.ids --expired-count 12000
-docker compose up -d --wait rental-maintenance
-python3 tools/loadtest/scripts/run-profile.py --out build/mixed.json \
-  --history-file build/mixed-history.ids -- -historical 15
-python3 tools/loadtest/scripts/check-profile-payments.py build/mixed.json > build/mixed-payments.json
+python3 tools/loadtest/scripts/run-profile.py --project "$COMPOSE_PROJECT_NAME" \
+  --out build/mixed.json --history-file build/mixed-history.ids --start-maintenance -- -historical 15
+python3 tools/loadtest/scripts/check-profile-payments.py --project "$COMPOSE_PROJECT_NAME" build/mixed.json > build/mixed-payments.json
 ```
 
-Если проекты используют одинаковые хостовые порты, остановите базовый проект своим `docker compose stop` до запуска смешанного. Опция `--expired-count 12000` показывает проверяемый пример генерации, по умолчанию она равна нулю. Maintenance может удалить этот раздел до начала измерения. До и после прогона сравните состояние БД и счётчик `rental_maintenance_rows_total{step="drop_partitions"}`.
+Чтобы в смешанном прогоне проверить реальные чтения с диска (превысив `shared_buffers = 512MB` в `compose.yaml`), задайте `--target-mib 700` (или больше) в `prepare-emulator-data.py`. Выгрузка и сверка UUID выполняются потоково с константным расходом памяти, а в манифесте выводятся `history_total_bytes`, `shared_buffers_bytes` и флаг `exceeds_shared_buffers`.
 
-Модуль [run-profile.py](../tools/loadtest/scripts/run-profile.py) запускает отдельный контейнер эмулятора через [Compose дополнение](../compose.loadtest.yaml), ждёт обработки задач и сверяет PostgreSQL с JSON. Для уже собранного образа можно передать `--no-build`. В полном запуске Payment проверяется выборкой по 1 000 завершённых поездок. Для короткой проверки уменьшите её флагом `--sample-size`. Для графиков используйте [export-window.py](../tools/loadtest/scripts/export-window.py) и адрес Prometheus выбранного проекта.
+Если проекты используют одинаковые хостовые порты, остановите базовый проект своим `docker compose stop` до запуска смешанного. Опция `--expired-count 12000` показывает проверяемый пример генерации, по умолчанию она равна нулю. Флаг `--start-maintenance` в `run-profile.py` запускает `rental-maintenance` уже после старта нагрузки, чтобы удаление просроченного раздела происходило параллельно с чтениями, а `history_before` фиксировал исходное число просроченных строк.
+
+Модуль [run-profile.py](../tools/loadtest/scripts/run-profile.py) запускает отдельный контейнер эмулятора через [Compose дополнение](../compose.loadtest.yaml), ждёт обработки задач, удаления `COMPLETED`-задач, архивации заказов и удаления просроченных разделов, сверяет PostgreSQL с JSON (включая `fallback_orders = 0`, `wrong_retention = 0`, `overlapping_user_rentals = 0` и отсутствие роста отставания в `backlog_summary`). Для уже собранного образа можно передать `--no-build`. При запуске CLI вне хоста БД с возможным дрейфом часов используйте `-clock-skew` (по умолчанию `1µs`). В полном запуске Payment проверяется выборкой по 1 000 завершённых поездок. Для короткой проверки уменьшите её флагом `--sample-size`. Для графиков и проверки стабилизации используйте [export-window.py](../tools/loadtest/scripts/export-window.py) с `--pre-minutes 1` и адресом Prometheus выбранного проекта.
 
 ## Проверка совместимости с `a607276`
 
