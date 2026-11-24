@@ -368,6 +368,8 @@ def main():
         )
         and summary["activation_p95_ms"] is not None
         and summary["activation_p95_ms"] <= 2000
+        and summary["mean_order_row_bytes_in_window"] is not None
+        and 900 <= summary["mean_order_row_bytes_in_window"] <= 1150
         and all(0.95 * result["rate"] <= summary[k] <= 1.05 * result["rate"] for k in ("activated_rps", "finished_rps"))
     )
     args.out.parent.mkdir(parents=True, exist_ok=True)

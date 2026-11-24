@@ -87,10 +87,10 @@ func (q *Queries) ArchiveOrders(ctx context.Context, limit int) (removed, archiv
 			DELETE FROM offers f USING removed_orders r WHERE f.offer_id = r.offer_id
 			RETURNING f.offer_id, f.user_profile_fallback_used
 		), archived AS (
-			INSERT INTO orders_history (`+orderColumns+`, user_profile_fallback_used)
+			INSERT INTO orders_history (`+orderColumns+`, user_profile_fallback_used, payload)
 			SELECT r.order_id, r.offer_id, r.user_id, r.scooter_id, r.zone_id, r.minute_rate, r.unlock_fee,
 				r.deposit, r.status, r.created_at, r.started_at, r.finish_time, r.closed_at, r.delete_after,
-				r.cost, f.user_profile_fallback_used
+				r.cost, f.user_profile_fallback_used, r.payload
 			FROM removed_orders r JOIN removed_offers f ON f.offer_id = r.offer_id
 			WHERE r.delete_after > clock_timestamp()
 			RETURNING 1

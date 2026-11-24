@@ -50,9 +50,9 @@ BEGIN
 END $$;
 
 -- Realistic mix of zones, tariffs, ride durations (4-6 min), and terminal
--- statuses (96% COMPLETED, 2% CANCELLED, 2% START_FAILED). The long synthetic
--- user identifier gives the requested ~1 KiB physical inline row without
--- triggering TOAST compression or changing the GET response size.
+-- statuses (96% COMPLETED, 2% CANCELLED, 2% START_FAILED). The 848-byte
+-- per-order payload matches the ~1 KiB inline row size of live orders
+-- without triggering TOAST compression or changing the GET response size.
 WITH tariffs(zone_idx, zone_id, base_rate, price_unlock, full_deposit) AS (
     VALUES (0, 'zone-1', 10, 50, 300),
            (1, 'zone-2', 12, 40, 250),
@@ -76,10 +76,10 @@ WITH tariffs(zone_idx, zone_id, base_rate, price_unlock, full_deposit) AS (
 )
 INSERT INTO orders_history (order_id, offer_id, user_id, scooter_id, zone_id,
     minute_rate, unlock_fee, deposit, status, created_at, started_at,
-    finish_time, closed_at, delete_after, cost, user_profile_fallback_used)
+    finish_time, closed_at, delete_after, cost, user_profile_fallback_used, payload)
 SELECT order_id,
        gen_random_uuid(),
-       'load-' || repeat(md5(order_id::text), 26),
+       'user-' || (1 + (n % 40000)),
        scooter_id,
        zone_id,
        minute_rate,
@@ -106,7 +106,8 @@ SELECT order_id,
            WHEN 'COMPLETED' THEN unlock_fee + (duration_s * minute_rate) / 60
            ELSE 0
        END AS cost,
-       false
+       false,
+       decode(repeat(md5(order_id::text), 53), 'hex')
 FROM priced;
 
 SELECT order_id FROM fixture_orders WHERE kind = 'retained' ORDER BY order_id::text COLLATE "C";
