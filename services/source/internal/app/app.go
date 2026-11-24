@@ -33,12 +33,15 @@ func Run(ctx context.Context) error {
 	if addr == "" {
 		addr = ":8080"
 	}
+	service, err := catalog.NewService(scooters, users)
+	if err != nil {
+		return fmt.Errorf("build Source catalog: %w", err)
+	}
 	slog.Info("serving Source stub", "addr", addr, "scooters", scooters, "users", users)
-	return start(ctx, addr, NewRouter(catalog.Seed(scooters, users)))
+	return start(ctx, addr, newRouter(service))
 }
 
-// NewRouter exposes the catalog through the agreed Source API.
-func NewRouter(c *catalog.Catalog) *echo.Echo {
+func newRouter(c *catalog.Service) *echo.Echo {
 	e := echo.New()
 	e.Logger = slog.Default()
 	e.HTTPErrorHandler = func(ctx *echo.Context, err error) {
@@ -48,12 +51,7 @@ func NewRouter(c *catalog.Catalog) *echo.Echo {
 		}
 		_ = ctx.JSON(status, errorBody{ErrorCode: strings.ToUpper(strings.ReplaceAll(http.StatusText(status), " ", "_"))})
 	}
-	e.GET("/scooter/:id", byID(c.Scooter))
-	e.GET("/tariff-zone/:id", byID(c.TariffZone))
-	e.GET("/user-profile/:id", byID(c.UserProfile))
-	e.GET("/configs", func(ctx *echo.Context) error {
-		return ctx.JSON(http.StatusOK, c.Configs())
-	})
+	c.RegisterRoutes(e)
 	e.GET("/healthz", func(ctx *echo.Context) error { return ctx.NoContent(http.StatusNoContent) })
 	e.GET("/metrics", echo.WrapHandler(promhttp.Handler()))
 	return e
@@ -61,20 +59,6 @@ func NewRouter(c *catalog.Catalog) *echo.Echo {
 
 type errorBody struct {
 	ErrorCode string `json:"error_code"`
-}
-
-func byID[T any](lookup func(string) (T, bool)) echo.HandlerFunc {
-	return func(ctx *echo.Context) error {
-		id := ctx.Param("id")
-		if id == "" {
-			return ctx.JSON(http.StatusBadRequest, errorBody{ErrorCode: "INVALID_REQUEST"})
-		}
-		value, ok := lookup(id)
-		if !ok {
-			return ctx.JSON(http.StatusNotFound, errorBody{ErrorCode: "NOT_FOUND"})
-		}
-		return ctx.JSON(http.StatusOK, value)
-	}
 }
 
 func start(ctx context.Context, addr string, e *echo.Echo) error {

@@ -11,27 +11,38 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/dkoptev06/sd-hw1-team4/services/rental/internal/metrics"
-	"github.com/dkoptev06/sd-hw1-team4/services/rental/internal/settings"
-	"github.com/dkoptev06/sd-hw1-team4/services/rental/internal/storage"
+	"github.com/dkoptev06/sd-hw1-team4/services/rental/internal/task"
 )
 
 const leaseName = "maintenance"
 
-type Maintenance struct {
-	store  *storage.Store
-	cfg    settings.Maintenance
+// Options configures archive batches, history cleanup, and the maintenance lease.
+type Options struct {
+	Interval      time.Duration
+	Lease         time.Duration
+	BatchSize     int
+	OfferGrace    time.Duration
+	WeeksAhead    int
+	StatsInterval time.Duration
+}
+
+type Service struct {
+	pool   *pgxpool.Pool
+	tasks  *task.Service
+	cfg    Options
 	holder uuid.UUID
 	log    *slog.Logger
 }
 
-func New(store *storage.Store, cfg settings.Maintenance, log *slog.Logger) *Maintenance {
-	return &Maintenance{store: store, cfg: cfg, holder: uuid.New(), log: log}
+func NewService(pool *pgxpool.Pool, tasks *task.Service, cfg Options, log *slog.Logger) *Service {
+	return &Service{pool: pool, tasks: tasks, cfg: cfg, holder: uuid.New(), log: log}
 }
 
 // Run executes a cycle every interval while holding the lease, until ctx is done.
-func (m *Maintenance) Run(ctx context.Context) error {
+func (m *Service) Run(ctx context.Context) error {
 	go m.statsLoop(ctx)
 	// Long-running partition DDL uses a separate session. Coalesce requests
 	// while old readers hold a DETACH open and keep draining the order queue.
@@ -71,8 +82,8 @@ func (m *Maintenance) Run(ctx context.Context) error {
 	}
 }
 
-func (m *Maintenance) renewLease(ctx context.Context, q *storage.Queries) (bool, error) {
-	held, err := q.AcquireLease(ctx, leaseName, m.holder, m.cfg.Lease)
+func (m *Service) renewLease(ctx context.Context, q repository) (bool, error) {
+	held, err := q.acquireLease(ctx, leaseName, m.holder, m.cfg.Lease)
 	if held {
 		metrics.MaintenanceLeaseHeld.Set(1)
 	} else {
@@ -81,10 +92,10 @@ func (m *Maintenance) renewLease(ctx context.Context, q *storage.Queries) (bool,
 	return held, err
 }
 
-func (m *Maintenance) release() {
+func (m *Service) release() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := m.store.ReleaseLease(ctx, leaseName, m.holder); err != nil {
+	if err := (repository{db: m.pool}).releaseLease(ctx, leaseName, m.holder); err != nil {
 		m.log.Warn("release maintenance lease", "error", err)
 	}
 	metrics.MaintenanceLeaseHeld.Set(0)
@@ -93,19 +104,9 @@ func (m *Maintenance) release() {
 // errLeaseLost stops a cycle when another replica took the lease.
 var errLeaseLost = errors.New("maintenance lease lost")
 
-// RunCycle runs one maintenance cycle when no other session is running it and the
-// lease is available to this replica.
-func (m *Maintenance) RunCycle(ctx context.Context) error {
-	held, err := m.archiveCycle(ctx)
-	if !held {
-		return err
-	}
-	return errors.Join(err, m.cleanPartitions(ctx))
-}
-
-func (m *Maintenance) archiveCycle(ctx context.Context) (bool, error) {
+func (m *Service) archiveCycle(ctx context.Context) (bool, error) {
 	var held bool
-	locked, err := m.store.WithMaintenanceLock(ctx, leaseName, func(q *storage.Queries) error {
+	locked, err := withSessionLock(ctx, m.pool, leaseName, func(q repository) error {
 		var err error
 		held, err = m.renewLease(ctx, q)
 		if !held || err != nil {
@@ -120,10 +121,10 @@ func (m *Maintenance) archiveCycle(ctx context.Context) (bool, error) {
 }
 
 // runCycle deletes completed tasks before selecting task-free orders for archiving.
-func (m *Maintenance) runCycle(ctx context.Context, q *storage.Queries) error {
+func (m *Service) runCycle(ctx context.Context, q repository) error {
 	steps := []struct {
 		name string
-		run  func(context.Context, *storage.Queries) error
+		run  func(context.Context, repository) error
 	}{
 		{"schedule_partitions", m.scheduleExpiredPartitions},
 		{"purge_tasks", m.purgeCompletedTasks},
@@ -143,7 +144,7 @@ func (m *Maintenance) runCycle(ctx context.Context, q *storage.Queries) error {
 }
 
 // batches calls fn until it processes less than a full batch, renewing the lease in between.
-func (m *Maintenance) batches(ctx context.Context, q *storage.Queries, step string, fn func() (int64, error)) error {
+func (m *Service) batches(ctx context.Context, q repository, step string, fn func() (int64, error)) error {
 	for {
 		n, err := fn()
 		if err != nil {
@@ -163,13 +164,13 @@ func (m *Maintenance) batches(ctx context.Context, q *storage.Queries, step stri
 	}
 }
 
-func (m *Maintenance) purgeCompletedTasks(ctx context.Context, q *storage.Queries) error {
+func (m *Service) purgeCompletedTasks(ctx context.Context, q repository) error {
 	return m.batches(ctx, q, "purge_tasks", func() (int64, error) {
-		return q.PurgeCompletedTasks(ctx, m.cfg.BatchSize)
+		return q.purgeCompletedTasks(ctx, m.cfg.BatchSize)
 	})
 }
 
-func (m *Maintenance) archiveOrders(ctx context.Context, q *storage.Queries) error {
+func (m *Service) archiveOrders(ctx context.Context, q repository) error {
 	var archived int64
 	err := m.batches(ctx, q, "archive_orders", func() (int64, error) {
 		removed, moved, err := m.archiveBatch(ctx, q)
@@ -183,10 +184,10 @@ func (m *Maintenance) archiveOrders(ctx context.Context, q *storage.Queries) err
 // archiveBatch creates the history partitions the next batch needs and archives it.
 // If the batch differs from the inspected candidates (rows locked or added in
 // between) and needs a missing partition, it inspects the candidates again.
-func (m *Maintenance) archiveBatch(ctx context.Context, q *storage.Queries) (removed, archived int64, err error) {
+func (m *Service) archiveBatch(ctx context.Context, q repository) (removed, archived int64, err error) {
 	const maxAttempts = 4
 	for attempt := 1; ; attempt++ {
-		weeks, err := q.ArchiveCandidateWeeks(ctx, m.cfg.BatchSize)
+		weeks, err := q.archiveCandidateWeeks(ctx, m.cfg.BatchSize)
 		if err != nil {
 			return 0, 0, err
 		}
@@ -194,15 +195,15 @@ func (m *Maintenance) archiveBatch(ctx context.Context, q *storage.Queries) (rem
 		if err != nil {
 			return 0, 0, err
 		}
-		removed, archived, err = q.ArchiveOrders(ctx, m.cfg.BatchSize, readyWeeks)
-		if !storage.IsMissingPartition(err) || attempt == maxAttempts {
+		removed, archived, err = q.archiveOrders(ctx, m.cfg.BatchSize, readyWeeks)
+		if !isMissingPartition(err) || attempt == maxAttempts {
 			return removed, archived, err
 		}
 	}
 }
 
-func (m *Maintenance) purgeExpiredOffers(ctx context.Context, q *storage.Queries) error {
+func (m *Service) purgeExpiredOffers(ctx context.Context, q repository) error {
 	return m.batches(ctx, q, "purge_offers", func() (int64, error) {
-		return q.PurgeExpiredOffers(ctx, m.cfg.OfferGrace, m.cfg.BatchSize)
+		return q.purgeExpiredOffers(ctx, m.cfg.OfferGrace, m.cfg.BatchSize)
 	})
 }

@@ -10,15 +10,14 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/dkoptev06/sd-hw1-team4/services/rental/internal/domain"
+	"github.com/dkoptev06/sd-hw1-team4/services/rental/internal/external/source"
 	"github.com/dkoptev06/sd-hw1-team4/services/rental/internal/metrics"
-	"github.com/dkoptev06/sd-hw1-team4/services/rental/internal/source"
 )
 
 // Snapshot is an immutable validated configuration.
 type Snapshot struct {
-	Coefficients domain.Coefficients
-	Retention    domain.Retention
+	Coefficients Coefficients
+	Retention    Retention
 	TariffTTL    time.Duration
 }
 
@@ -37,25 +36,25 @@ func defaultConfigs() source.Configs {
 	var raw source.Configs
 	raw.PriceCoeffSettings.Surge = "1.25"
 	raw.PriceCoeffSettings.LowChargeDiscount = "0.8"
-	raw.DefaultRetentionDays = domain.DefaultRetentionDays
+	raw.DefaultRetentionDays = defaultRetentionDays
 	raw.RetentionDaysByZone = map[string]int{}
 	return raw
 }
 
 // Parse validates a raw /configs response. A missing TTL takes the default of 10 minutes.
 func Parse(raw source.Configs) (Snapshot, error) {
-	surge, err := domain.ParseCoefficient(raw.PriceCoeffSettings.Surge.String())
+	surge, err := parseCoefficient(raw.PriceCoeffSettings.Surge.String())
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("surge: %w", err)
 	}
-	discount, err := domain.ParseCoefficient(raw.PriceCoeffSettings.LowChargeDiscount.String())
+	discount, err := parseCoefficient(raw.PriceCoeffSettings.LowChargeDiscount.String())
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("low_charge_discount: %w", err)
 	}
 	if raw.RetentionDaysByZone == nil {
 		return Snapshot{}, errors.New("retention_days_by_zone must be an object")
 	}
-	retention, err := domain.NewRetention(raw.DefaultRetentionDays, raw.RetentionDaysByZone)
+	retention, err := NewRetention(raw.DefaultRetentionDays, raw.RetentionDaysByZone)
 	if err != nil {
 		return Snapshot{}, err
 	}
@@ -71,7 +70,7 @@ func Parse(raw source.Configs) (Snapshot, error) {
 		return Snapshot{}, fmt.Errorf("tariff_zone_cache_ttl_minutes must not exceed %d", maxTariffTTLMinutes)
 	}
 	return Snapshot{
-		Coefficients: domain.Coefficients{Surge: surge, LowChargeDiscount: discount},
+		Coefficients: Coefficients{Surge: surge, LowChargeDiscount: discount},
 		Retention:    retention,
 		TariffTTL:    time.Duration(ttlMinutes) * time.Minute,
 	}, nil

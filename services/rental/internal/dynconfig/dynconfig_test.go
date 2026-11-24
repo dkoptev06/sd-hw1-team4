@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dkoptev06/sd-hw1-team4/services/rental/internal/source"
+	"github.com/dkoptev06/sd-hw1-team4/services/rental/internal/external/source"
 )
 
 type fetcherFunc func(context.Context) (source.Configs, error)

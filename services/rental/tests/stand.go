@@ -1,6 +1,5 @@
 //go:build functional
 
-// Package tests provides the shared stand and fixtures for functional scenarios.
 package tests
 
 import (
@@ -19,8 +18,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-
-	"github.com/dkoptev06/sd-hw1-team4/services/rental/internal/testdb"
 )
 
 type Stand struct {
@@ -35,7 +32,7 @@ func NewStand(t *testing.T, binary string) *Stand {
 	if dsn == "" {
 		t.Fatal("set RENTAL_TEST_DATABASE_URL to run functional tests")
 	}
-	db := testdb.New(t).Pool()
+	db := NewDB(t)
 	schema := db.Config().ConnConfig.RuntimeParams["search_path"]
 
 	if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {

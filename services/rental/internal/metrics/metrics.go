@@ -102,6 +102,12 @@ var (
 	TasksByState = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: namespace, Name: "tasks", Help: "Tasks by kind and status.",
 	}, []string{"kind", "status"})
+	ReadyTasks = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: namespace, Name: "tasks_ready", Help: "Pending tasks eligible to be claimed by kind.",
+	}, []string{"kind"})
+	OldestReadyTaskWait = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: namespace, Name: "tasks_oldest_ready_wait_seconds", Help: "Time since the oldest claimable task of this kind became ready.",
+	}, []string{"kind"})
 	OldestTaskAge = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: namespace, Name: "tasks_oldest_age_seconds", Help: "Age of the oldest task by status.",
 	}, []string{"status"})
@@ -110,6 +116,9 @@ var (
 	}, []string{"status"})
 	OldestClosedOrderAge = promauto.NewGauge(prometheus.GaugeOpts{
 		Namespace: namespace, Name: "orders_oldest_closed_age_seconds", Help: "Age of the oldest closed order not yet archived.",
+	})
+	ArchiveOldestReadyOrderAge = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: namespace, Name: "archive_oldest_ready_order_age_seconds", Help: "Time since the oldest closed order without tasks was closed.",
 	})
 	HistoryPartitions = promauto.NewGauge(prometheus.GaugeOpts{
 		Namespace: namespace, Name: "history_partitions", Help: "Attached orders_history partitions.",

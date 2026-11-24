@@ -1,108 +1,77 @@
-// Package catalog holds the in-memory data served by the Source stub.
+// Package catalog serves the immutable in-memory Source catalog.
 package catalog
 
 import (
-	"encoding/json"
+	"errors"
 	"fmt"
-	"sync"
 )
 
-type Scooter struct {
-	ID     string `json:"id"`
-	ZoneID string `json:"zone_id"`
-	Charge int    `json:"charge"`
+type Service struct {
+	scooters map[string]scooter
+	zones    map[string]tariffZone
+	users    map[string]userProfile
+	config   configs
 }
 
-type TariffZone struct {
-	ID             string `json:"id"`
-	PricePerMinute int64  `json:"price_per_minute"`
-	PriceUnlock    int64  `json:"price_unlock"`
-	DefaultDeposit int64  `json:"default_deposit"`
-}
-
-type UserProfile struct {
-	ID              string `json:"id"`
-	HasSubscription bool   `json:"has_subscription"`
-	Trusted         bool   `json:"trusted"`
-}
-
-type PriceCoeffSettings struct {
-	Surge             json.Number `json:"surge"`
-	LowChargeDiscount json.Number `json:"low_charge_discount"`
-}
-
-type Configs struct {
-	PriceCoeffSettings        PriceCoeffSettings `json:"price_coeff_settings"`
-	DefaultRetentionDays      int                `json:"default_retention_days"`
-	RetentionDaysByZone       map[string]int     `json:"retention_days_by_zone"`
-	TariffZoneCacheTTLMinutes int                `json:"tariff_zone_cache_ttl_minutes"`
-}
-
-// Catalog is safe for concurrent use.
-type Catalog struct {
-	mu       sync.RWMutex
-	scooters map[string]Scooter
-	zones    map[string]TariffZone
-	users    map[string]UserProfile
-	configs  Configs
-}
-
-// Seed builds the data set of the load test plan: scooters spread evenly over
-// four zones with charge on both sides of the low-charge threshold, and users
-// with every combination of subscription and trust.
-func Seed(scooters, users int) *Catalog {
-	c := &Catalog{
-		scooters: make(map[string]Scooter, scooters),
-		zones:    make(map[string]TariffZone, 4),
-		users:    make(map[string]UserProfile, users),
-		configs: Configs{
-			PriceCoeffSettings:        PriceCoeffSettings{Surge: "1.25", LowChargeDiscount: "0.8"},
-			DefaultRetentionDays:      365,
-			RetentionDaysByZone:       map[string]int{},
-			TariffZoneCacheTTLMinutes: 10,
-		},
+// NewService seeds the four tariff zones and the pricing cases used by the load test.
+func NewService(scooters, users int) (*Service, error) {
+	if scooters < 0 || users < 0 {
+		return nil, errors.New("catalog sizes must be non-negative")
 	}
-	tariffs := []struct{ perMinute, unlock, deposit int64 }{{10, 50, 300}, {12, 40, 250}, {8, 30, 200}, {15, 60, 350}}
+
+	config, err := newConfigs(1.25, 0.8, 365, nil, 10)
+	if err != nil {
+		return nil, err
+	}
+	tariffs := []struct{ perMinute, unlock, deposit int64 }{
+		{10, 50, 300},
+		{12, 40, 250},
+		{8, 30, 200},
+		{15, 60, 350},
+	}
+	c := &Service{
+		scooters: make(map[string]scooter, scooters),
+		zones:    make(map[string]tariffZone, len(tariffs)),
+		users:    make(map[string]userProfile, users),
+		config:   config,
+	}
 	for i, t := range tariffs {
-		id := zoneID(i)
-		c.zones[id] = TariffZone{ID: id, PricePerMinute: t.perMinute, PriceUnlock: t.unlock, DefaultDeposit: t.deposit}
+		zone, err := newTariffZone(zoneID(i), t.perMinute, t.unlock, t.deposit)
+		if err != nil {
+			return nil, err
+		}
+		c.zones[zone.id] = zone
 	}
 	for i := 1; i <= scooters; i++ {
-		id := fmt.Sprintf("scooter-%d", i)
-		c.scooters[id] = Scooter{ID: id, ZoneID: zoneID(i % len(tariffs)), Charge: i * 37 % 101}
+		value, err := newScooter(fmt.Sprintf("scooter-%d", i), zoneID(i%len(tariffs)), i*37%101)
+		if err != nil {
+			return nil, err
+		}
+		c.scooters[value.id] = value
 	}
 	for i := 1; i <= users; i++ {
-		id := fmt.Sprintf("user-%d", i)
-		c.users[id] = UserProfile{ID: id, HasSubscription: i%4 == 0, Trusted: i%3 == 0}
+		value, err := newUserProfile(fmt.Sprintf("user-%d", i), i%4 == 0, i%3 == 0)
+		if err != nil {
+			return nil, err
+		}
+		c.users[value.id] = value
 	}
-	return c
+	return c, nil
 }
 
 func zoneID(i int) string { return fmt.Sprintf("zone-%d", i+1) }
 
-func (c *Catalog) Scooter(id string) (Scooter, bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	s, ok := c.scooters[id]
-	return s, ok
+func (c *Service) scooter(id string) (scooter, bool) {
+	value, ok := c.scooters[id]
+	return value, ok
 }
 
-func (c *Catalog) TariffZone(id string) (TariffZone, bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	z, ok := c.zones[id]
-	return z, ok
+func (c *Service) tariffZone(id string) (tariffZone, bool) {
+	value, ok := c.zones[id]
+	return value, ok
 }
 
-func (c *Catalog) UserProfile(id string) (UserProfile, bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	u, ok := c.users[id]
-	return u, ok
-}
-
-func (c *Catalog) Configs() Configs {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.configs
+func (c *Service) userProfile(id string) (userProfile, bool) {
+	value, ok := c.users[id]
+	return value, ok
 }

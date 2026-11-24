@@ -1,0 +1,165 @@
+package app
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"strconv"
+	"time"
+
+	"github.com/dkoptev06/sd-hw1-team4/services/rental/internal/maintenance"
+	"github.com/dkoptev06/sd-hw1-team4/services/rental/internal/order"
+	"github.com/dkoptev06/sd-hw1-team4/services/rental/internal/task"
+	"github.com/dkoptev06/sd-hw1-team4/services/rental/internal/worker"
+)
+
+type settings struct {
+	HTTPAddr    string
+	DatabaseURL string
+	DBMaxConns  int32
+
+	SourceURL       string
+	SourceTimeout   time.Duration
+	ConfigTimeout   time.Duration
+	ConfigRefresh   time.Duration
+	TariffCacheSize int
+
+	PaymentURL     string
+	PaymentTimeout time.Duration
+
+	OfferTTL  time.Duration
+	StartTTL  time.Duration
+	HoldGrace time.Duration
+
+	OrderCache  orderCacheSettings
+	Worker      worker.Options
+	Tasks       task.Options
+	Maintenance maintenance.Options
+}
+
+type orderCacheSettings struct {
+	order.CacheOptions
+	RedisURL      string
+	RedisTimeout  time.Duration
+	RedisPoolSize int
+}
+
+// loadSettings reads settings; every value except DATABASE_URL has a default.
+func loadSettings() (settings, error) {
+	e := env{}
+	s := settings{
+		HTTPAddr:    e.str("RENTAL_HTTP_ADDR", ":8080"),
+		DatabaseURL: e.str("DATABASE_URL", ""),
+		DBMaxConns:  int32(e.int("RENTAL_DB_MAX_CONNS", 20)),
+
+		SourceURL:       e.str("SOURCE_URL", "http://source:8080"),
+		SourceTimeout:   e.dur("SOURCE_TIMEOUT", 500*time.Millisecond),
+		ConfigTimeout:   e.dur("CONFIG_TIMEOUT", 2*time.Second),
+		ConfigRefresh:   e.dur("CONFIG_REFRESH_INTERVAL", time.Minute),
+		TariffCacheSize: e.int("TARIFF_CACHE_SIZE", 10_000),
+
+		PaymentURL:     e.str("PAYMENT_URL", "http://payment:8080"),
+		PaymentTimeout: e.dur("PAYMENT_TIMEOUT", 3*time.Second),
+
+		OfferTTL:  e.dur("OFFER_TTL", 2*time.Minute),
+		StartTTL:  e.dur("START_TTL", 2*time.Minute),
+		HoldGrace: e.dur("HOLD_GRACE", time.Hour),
+
+		OrderCache: orderCacheSettings{
+			RedisURL:      e.str("REDIS_URL", ""),
+			RedisTimeout:  e.dur("ORDER_CACHE_REDIS_TIMEOUT", 50*time.Millisecond),
+			RedisPoolSize: e.int("ORDER_CACHE_REDIS_POOL_SIZE", 64),
+			CacheOptions: order.CacheOptions{
+				Size:                  e.int("ORDER_CACHE_SIZE", 65_536),
+				TTL:                   e.dur("ORDER_CACHE_TTL", time.Minute),
+				RedisCooldown:         e.dur("ORDER_CACHE_REDIS_COOLDOWN", 5*time.Second),
+				DBMaxConcurrency:      e.int("ORDER_READ_DB_MAX_CONCURRENCY", 24),
+				DBDegradedConcurrency: e.int("ORDER_READ_DEGRADED_CONCURRENCY", 12),
+				DBWaitTimeout:         e.dur("ORDER_READ_DB_WAIT", 250*time.Millisecond),
+			},
+		},
+
+		Worker: worker.Options{
+			Concurrency:     e.int("WORKER_CONCURRENCY", 64),
+			BatchSize:       e.int("WORKER_BATCH_SIZE", 32),
+			PollInterval:    e.dur("WORKER_POLL_INTERVAL", 100*time.Millisecond),
+			SweepInterval:   e.dur("WORKER_SWEEP_INTERVAL", time.Second),
+			ShutdownTimeout: e.dur("WORKER_SHUTDOWN_TIMEOUT", 20*time.Second),
+		},
+		Tasks: task.Options{
+			Lease:       e.dur("WORKER_LEASE", 15*time.Second),
+			BackoffBase: e.dur("WORKER_BACKOFF_BASE", 500*time.Millisecond),
+			BackoffMax:  e.dur("WORKER_BACKOFF_MAX", 5*time.Minute),
+			MaxAttempts: task.MaxAttempts{
+				task.Start:  e.int("START_MAX_ATTEMPTS", 5),
+				task.Settle: e.int("SETTLE_MAX_ATTEMPTS", 20),
+				task.Void:   e.int("VOID_MAX_ATTEMPTS", 20),
+			},
+		},
+		Maintenance: maintenance.Options{
+			Interval:      e.dur("MAINTENANCE_INTERVAL", time.Minute),
+			Lease:         e.dur("MAINTENANCE_LEASE", 5*time.Minute),
+			BatchSize:     e.int("MAINTENANCE_BATCH_SIZE", 2000),
+			OfferGrace:    e.dur("MAINTENANCE_OFFER_GRACE", 10*time.Minute),
+			WeeksAhead:    e.int("MAINTENANCE_PARTITION_WEEKS_AHEAD", 54),
+			StatsInterval: e.dur("MAINTENANCE_STATS_INTERVAL", 15*time.Second),
+		},
+	}
+	if s.DatabaseURL == "" {
+		e.errs = append(e.errs, errors.New("DATABASE_URL is required"))
+	}
+	for name, v := range map[string]int{
+		"RENTAL_DB_MAX_CONNS": int(s.DBMaxConns), "TARIFF_CACHE_SIZE": s.TariffCacheSize,
+		"ORDER_CACHE_SIZE": s.OrderCache.Size, "ORDER_CACHE_REDIS_POOL_SIZE": s.OrderCache.RedisPoolSize,
+		"ORDER_READ_DB_MAX_CONCURRENCY":      s.OrderCache.DBMaxConcurrency,
+		"ORDER_READ_DB_DEGRADED_CONCURRENCY": s.OrderCache.DBDegradedConcurrency,
+		"WORKER_CONCURRENCY":                 s.Worker.Concurrency, "WORKER_BATCH_SIZE": s.Worker.BatchSize,
+		"MAINTENANCE_BATCH_SIZE": s.Maintenance.BatchSize, "MAINTENANCE_PARTITION_WEEKS_AHEAD": s.Maintenance.WeeksAhead,
+	} {
+		if v <= 0 {
+			e.errs = append(e.errs, fmt.Errorf("%s must be positive", name))
+		}
+	}
+	for kind, v := range s.Tasks.MaxAttempts {
+		if v <= 0 {
+			e.errs = append(e.errs, fmt.Errorf("max attempts for %s must be positive", kind))
+		}
+	}
+	if s.PaymentTimeout >= s.Tasks.Lease {
+		e.errs = append(e.errs, errors.New("PAYMENT_TIMEOUT must be shorter than WORKER_LEASE"))
+	}
+	return s, errors.Join(e.errs...)
+}
+
+type env struct{ errs []error }
+
+func (e *env) str(key, def string) string {
+	if v, ok := os.LookupEnv(key); ok && v != "" {
+		return v
+	}
+	return def
+}
+
+func (e *env) int(key string, def int) int {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		e.errs = append(e.errs, fmt.Errorf("%s: %w", key, err))
+	}
+	return n
+}
+
+func (e *env) dur(key string, def time.Duration) time.Duration {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		e.errs = append(e.errs, fmt.Errorf("%s: invalid positive duration %q", key, v))
+	}
+	return d
+}

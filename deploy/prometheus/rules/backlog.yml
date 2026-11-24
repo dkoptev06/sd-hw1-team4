@@ -1,0 +1,30 @@
+groups:
+  - name: rental-backlog
+    rules:
+      - record: rental:ready_tasks:max
+        expr: |
+          max by (kind) (
+            rental_tasks_ready{job="rental-maintenance"}
+          )
+
+      - alert: RentalReadyTasksGrowing
+        expr: |
+          (rental:ready_tasks:max > rental:ready_tasks:max offset 5m)
+          and
+          (rental:ready_tasks:max offset 5m > rental:ready_tasks:max offset 10m)
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Очередь готовых задач {{ $labels.kind }} растёт"
+          description: "Число готовых задач выросло в каждом из двух 5-минутных окон. Проверьте ожидание в очереди и журнал worker."
+
+      - alert: RentalArchiveLagHigh
+        expr: |
+          max(rental_archive_oldest_ready_order_age_seconds{job="rental-maintenance"}) > 180
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Архивация заказов отстаёт"
+          description: "Старейший закрытый заказ без связанных задач ждёт больше 3 минут. Проверьте журнал maintenance."

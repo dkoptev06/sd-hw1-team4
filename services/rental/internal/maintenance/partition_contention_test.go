@@ -5,9 +5,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dkoptev06/sd-hw1-team4/services/rental/internal/domain"
-	"github.com/dkoptev06/sd-hw1-team4/services/rental/internal/storage"
-	"github.com/dkoptev06/sd-hw1-team4/services/rental/internal/testdb"
+	"github.com/dkoptev06/sd-hw1-team4/services/rental/internal/order"
+	"github.com/dkoptev06/sd-hw1-team4/services/rental/internal/platform/postgres"
+	"github.com/dkoptev06/sd-hw1-team4/services/rental/tests"
 )
 
 func TestMissingPartitionDuringDetach(t *testing.T) {
@@ -19,38 +19,38 @@ func TestMissingPartitionDuringDetach(t *testing.T) {
 		{"older order needs an on-demand week", 2, 12},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			store := testdb.New(t)
+			store := tests.NewDB(t)
 			m := newMaintenance(t, store)
 			m.cfg.WeeksAhead, m.cfg.BatchSize = test.weeksAhead, 1
 			ctx, cancel := context.WithTimeout(t.Context(), 12*time.Second)
 			defer cancel()
-			now, err := store.Now(ctx)
+			now, err := postgres.Now(ctx, store)
 			if err != nil {
 				t.Fatal(err)
 			}
-			week := storage.WeekStart(now)
+			week := weekStart(now)
 			old := week.AddDate(0, 0, -7)
 			ready := week.AddDate(0, 0, 7)
 			missing := week.AddDate(0, 0, 7*test.missingWeekOffset)
 			for _, w := range []time.Time{old, week, ready} {
-				if err := store.CreatePartition(ctx, w); err != nil {
+				if err := (repository{db: store}).createPartition(ctx, w); err != nil {
 					t.Fatal(err)
 				}
 			}
 			oldID := insertArchivedOrder(t, store, old.Add(time.Hour))
 			control := insertArchivedOrder(t, store, ready.Add(time.Hour))
-			deferred, _ := insertClosedOrder(t, store, closedOrder{status: domain.OrderCompleted, deleteAfter: "30 days"})
-			free, offer := insertClosedOrder(t, store, closedOrder{status: domain.OrderCompleted, deleteAfter: "30 days"})
+			deferred, _ := insertClosedOrder(t, store, closedOrder{status: order.Completed, deleteAfter: "30 days"})
+			free, offer := insertClosedOrder(t, store, closedOrder{status: order.Completed, deleteAfter: "30 days"})
 			// The oldest candidate fills the whole batch and needs a missing week.
-			testdb.Exec(t, store, `UPDATE orders SET closed_at = closed_at - interval '1 hour',
+			tests.ExecSQL(t, store, `UPDATE orders SET closed_at = closed_at - interval '1 hour',
 				delete_after = $2 WHERE order_id = $1`, deferred, missing.Add(time.Hour))
-			testdb.Exec(t, store, `UPDATE orders SET delete_after = $2 WHERE order_id = $1`, free, ready.Add(time.Hour))
+			tests.ExecSQL(t, store, `UPDATE orders SET delete_after = $2 WHERE order_id = $1`, free, ready.Add(time.Hour))
 
-			oldName := storage.PartitionName(old)
-			if err := store.SchedulePartitionDrop(ctx, oldName, old); err != nil {
+			oldName := partitionName(old)
+			if err := (repository{db: store}).schedulePartitionDrop(ctx, oldName, old); err != nil {
 				t.Fatal(err)
 			}
-			reader, err := store.Pool().Begin(ctx)
+			reader, err := store.Begin(ctx)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -73,7 +73,7 @@ func TestMissingPartitionDuringDetach(t *testing.T) {
 			defer ticker.Stop()
 			for {
 				var pending bool
-				if err := store.Pool().QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_inherits
+				if err := store.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_inherits
 					WHERE inhrelid = to_regclass($1) AND inhdetachpending)`, oldName).Scan(&pending); err != nil {
 					t.Fatal(err)
 				}
@@ -91,20 +91,20 @@ func TestMissingPartitionDuringDetach(t *testing.T) {
 
 			attempt, stop := context.WithTimeout(ctx, 3*time.Second)
 			defer stop()
-			if err := m.RunCycle(attempt); err != nil {
+			if err := runMaintenanceCycle(m, attempt); err != nil {
 				t.Fatalf("archive cycle while DETACH waited: %v", err)
 			}
-			if _, archived, _, err := store.GetOrder(attempt, control); err != nil || !archived {
-				t.Fatalf("existing history became unreadable: archived=%t, %v", archived, err)
+			if view, err := readOrders(store).Get(attempt, control); err != nil || !view.Archived {
+				t.Fatalf("existing history became unreadable: archived=%t, %v", view.Archived, err)
 			}
-			if _, archived, _, err := store.GetOrder(attempt, free); err != nil || !archived {
-				t.Fatalf("ready week stalled behind missing week: archived=%t, %v", archived, err)
+			if view, err := readOrders(store).Get(attempt, free); err != nil || !view.Archived {
+				t.Fatalf("ready week stalled behind missing week: archived=%t, %v", view.Archived, err)
 			}
-			if got, err := store.FindOrderByOffer(attempt, offer); err != nil || got.ID != free {
+			if got, err := readOrders(store).Start(attempt, offer); err != nil || got.OrderID != free {
 				t.Fatalf("order replay during DETACH: %+v, %v", got, err)
 			}
-			if _, archived, _, err := store.GetOrder(attempt, deferred); err != nil || archived {
-				t.Fatalf("order awaiting partition: archived=%t, %v", archived, err)
+			if view, err := readOrders(store).Get(attempt, deferred); err != nil || view.Archived {
+				t.Fatalf("order awaiting partition: archived=%t, %v", view.Archived, err)
 			}
 
 			if err := reader.Rollback(ctx); err != nil {
@@ -114,14 +114,14 @@ func TestMissingPartitionDuringDetach(t *testing.T) {
 			if cleanupErr != nil {
 				t.Fatal(cleanupErr)
 			}
-			if err := m.RunCycle(ctx); err != nil {
+			if err := runMaintenanceCycle(m, ctx); err != nil {
 				t.Fatal(err)
 			}
-			if _, archived, _, err := store.GetOrder(ctx, deferred); err != nil || !archived {
-				t.Fatalf("order for missing week after release: archived=%t, %v", archived, err)
+			if view, err := readOrders(store).Get(ctx, deferred); err != nil || !view.Archived {
+				t.Fatalf("order for missing week after release: archived=%t, %v", view.Archived, err)
 			}
 			if n := count(t, store, `SELECT count(*) FROM pg_inherits
-				WHERE inhparent = 'orders_history'::regclass AND inhrelid = to_regclass($1)`, storage.PartitionName(missing)); n != 1 {
+				WHERE inhparent = 'orders_history'::regclass AND inhrelid = to_regclass($1)`, partitionName(missing)); n != 1 {
 				t.Fatal("required week was not attached after DETACH completed")
 			}
 		})

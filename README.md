@@ -20,18 +20,18 @@ Rental выдаёт офферы и ведёт заказы в PostgreSQL. Sourc
 
 ```
 services/rental/internal/
-  domain/       модели, инварианты, цена и стоимость поездки, правила задач (без I/O)
-  storage/      весь SQL; транзакции через Store.InTx
-  rental/       сценарии API: офферы и заказы
-  worker/       выполнение задач и sweeps по дедлайну и лимиту попыток
-  maintenance/  архивация, очистка, разделы, метрики состояния БД
-  httpapi/      HTTP-обработчики и коды ошибок
-  source/       клиент Source и LRU-кэш тарифных зон
-  ordercache/   кэш архивных заказов и ограничение чтений из PostgreSQL
-  payment/      клиент Payment
-  dynconfig/    снимок /configs: обновление раз в минуту, дефолты на холодном старте
-  settings/     настройки процесса из переменных окружения
-  app/          сборка процессов
+  offer/        модель оффера, сервис, SQL, HTTP и DTO
+  order/        модель заказа, цена, чтение истории, кэш, SQL и HTTP
+  task/         модель задачи, захват, повторы, DLQ и SQL
+  platform/postgres/   пул, транзакции и время PostgreSQL
+  platform/httpx/      HTTP-клиент и декодирование JSON
+  worker/       диспетчеризация задач и вызовы Payment
+  maintenance/  архивация, очистка, разделы, метрики состояния БД и SQL обслуживания
+  external/source/     клиент Source и LRU-кэш тарифных зон
+  external/payment/    клиент Payment
+  external/redis/      клиент Redis
+  dynconfig/    снимок /configs, коэффициенты цены и политика хранения
+  app/          загрузка настроек, сборка процессов и маршрутов, преобразование ошибок HTTP
 ```
 
 ## Команды
@@ -73,19 +73,25 @@ curl localhost:18080/orders/<order_id>
 curl -X POST localhost:18080/orders/<order_id>/finish
 ```
 
-## Оповещение о DLQ
+## Оповещения Prometheus
 
-Алерт `RentalTaskDeadLettered` срабатывает отдельно для SETTLE и VOID, если за последние две минуты были попадания в DLQ или в очереди остаются задачи этого типа. Причину можно посмотреть через `rental dlq list` и в журнале worker. [Вкладка Alerts в Prometheus](http://localhost:19090/alerts)
+- `RentalTaskDeadLettered` срабатывает при попадании задачи в DLQ за последние две минуты или пока в DLQ остаются задачи. Алерт срабатывает отдельно для SETTLE и VOID.
+- `RentalReadyTasksGrowing` сообщает о росте числа готовых к захвату задач в каждом из двух последовательных окон по 5 минут, если условие выполняется 2 минуты. Рост оценивается отдельно для START, SETTLE и VOID.
+- `RentalArchiveLagHigh` срабатывает, если возраст старейшего закрытого заказа без связанных задач превышает 3 минуты на протяжении 5 минут.
 
-Чтобы проверить правило, выполните команду из корня проекта.
+Метрика `rental_tasks_ready` считает только готовые к захвату задачи. `rental_tasks_oldest_ready_wait_seconds` показывает, сколько старейшая готовая задача ждёт с момента наступления `next_run_at` или истечения lease, если оно наступило позже. Обе метрики публикует maintenance с разбивкой по типам задач. При переопределении `START_MAX_ATTEMPTS`, `SETTLE_MAX_ATTEMPTS` и `VOID_MAX_ATTEMPTS` используйте одинаковые значения для worker и maintenance.
+
+DLQ можно проверить через `rental dlq list` и журнал worker. Причины задержки архивации смотрите в журнале maintenance. [Вкладка Alerts в Prometheus](http://localhost:19090/alerts)
+
+Проверить правила из корня проекта можно так.
 
 ```sh
-docker run --rm --entrypoint /bin/promtool -v "$PWD/deploy/prometheus:/rules:ro" prom/prometheus:v3.5.0 test rules /rules/tests/dlq.test.yml
+docker run --rm --entrypoint /bin/promtool -v "$PWD/deploy/prometheus:/rules:ro" prom/prometheus:v3.5.0 test rules /rules/tests/dlq.test.yml /rules/tests/backlog.test.yml
 ```
 
 ## Настройки Rental
 
-Обязательна только `DATABASE_URL`. Остальные переменные имеют значения по умолчанию, полный список — в [settings.go](services/rental/internal/settings/settings.go). Основные:
+Обязательна только `DATABASE_URL`. Остальные переменные имеют значения по умолчанию, полный список — в [settings.go](services/rental/internal/app/settings.go). Основные:
 
 | Переменная | По умолчанию | Назначение |
 | --- | --- | --- |

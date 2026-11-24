@@ -23,7 +23,7 @@ func call(t *testing.T, router http.Handler, method, path, body string) (int, ma
 }
 
 func TestContract(t *testing.T) {
-	router := NewRouter(ledger.New(func() time.Time { return time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC) }, false))
+	router := newRouter(ledger.NewService(func() time.Time { return time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC) }, false))
 	hold := `{"operation_id":"op","user_id":"u","amount":300,"hold_expires_at":"2026-11-24T13:00:00Z"}`
 
 	steps := []struct {
@@ -52,11 +52,11 @@ func TestContract(t *testing.T) {
 
 func TestSettleRequiresNonNegativeIntegerAmount(t *testing.T) {
 	now := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
-	l := ledger.New(func() time.Time { return now }, false)
+	l := ledger.NewService(func() time.Time { return now }, false)
 	if _, err := l.Hold("op", "u", 300, now.Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	router := NewRouter(l)
+	router := newRouter(l)
 	const fields = `{"operation_id":"op","user_id":"u"`
 
 	for _, tt := range []struct {
@@ -76,28 +76,28 @@ func TestSettleRequiresNonNegativeIntegerAmount(t *testing.T) {
 				t.Fatalf("SETTLE = %d %v, want 400 INVALID_REQUEST", status, body)
 			}
 			status, body = call(t, router, http.MethodGet, "/payment/op", "")
-			if status != http.StatusOK || body["status"] != ledger.StatusHeld {
+			if status != http.StatusOK || body["status"] != "HELD" {
 				t.Fatalf("payment = %d %v, want 200 HELD", status, body)
 			}
 		})
 	}
 
 	status, body := call(t, router, http.MethodPost, "/payments/settle", fields+`,"total_amount":0}`)
-	if status != http.StatusOK || body["status"] != ledger.Success {
+	if status != http.StatusOK || body["status"] != "success" {
 		t.Fatalf("SETTLE with explicit zero = %d %v, want 200 success", status, body)
 	}
 	status, body = call(t, router, http.MethodGet, "/payment/op", "")
-	if status != http.StatusOK || body["status"] != ledger.StatusPaid {
+	if status != http.StatusOK || body["status"] != "PAID" {
 		t.Fatalf("payment after zero SETTLE = %d %v, want 200 PAID", status, body)
 	}
 }
 
 func TestSettleLargeAmountsAreExact(t *testing.T) {
-	router := NewRouter(ledger.New(time.Now, false))
+	router := newRouter(ledger.NewService(time.Now, false))
 	const fields = `{"operation_id":"op","user_id":"u","total_amount":`
 	for range 2 {
 		status, body := call(t, router, http.MethodPost, "/payments/settle", fields+"9223372036854775847}")
-		if status != http.StatusOK || body["status"] != ledger.Success {
+		if status != http.StatusOK || body["status"] != "success" {
 			t.Fatalf("exact SETTLE = %d %v, want 200 success", status, body)
 		}
 	}
