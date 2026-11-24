@@ -6,6 +6,7 @@ package ledger
 
 import (
 	"errors"
+	"math/big"
 	"strings"
 	"sync"
 	"time"
@@ -42,7 +43,7 @@ type hold struct {
 }
 
 type settle struct {
-	total  int64
+	total  big.Int
 	result string
 }
 
@@ -54,13 +55,14 @@ type operation struct {
 }
 
 type Ledger struct {
-	mu  sync.Mutex
-	ops map[string]*operation
-	now func() time.Time
+	mu         sync.Mutex
+	ops        map[string]*operation
+	now        func() time.Time
+	failSettle bool
 }
 
-func New(now func() time.Time) *Ledger {
-	return &Ledger{ops: map[string]*operation{}, now: now}
+func New(now func() time.Time, failSettle bool) *Ledger {
+	return &Ledger{ops: map[string]*operation{}, now: now, failSettle: failSettle}
 }
 
 func (l *Ledger) op(id string) *operation {
@@ -109,8 +111,8 @@ func (l *Ledger) Hold(operationID, userID string, amount int64, expiresAt time.T
 }
 
 // Settle charges the final amount, with or without a hold, and releases the rest of a live hold.
-func (l *Ledger) Settle(operationID, userID string, total int64) (string, error) {
-	if blank(operationID) || blank(userID) || total < 0 {
+func (l *Ledger) Settle(operationID, userID string, total *big.Int) (string, error) {
+	if blank(operationID) || blank(userID) || total == nil || total.Sign() < 0 {
 		return "", ErrInvalid
 	}
 	l.mu.Lock()
@@ -120,7 +122,7 @@ func (l *Ledger) Settle(operationID, userID string, total int64) (string, error)
 	}
 	op := l.op(operationID)
 	if op.settle != nil {
-		if op.settle.total != total {
+		if op.settle.total.Cmp(total) != 0 {
 			return "", ErrParameterConflict
 		}
 		return op.settle.result, nil
@@ -129,8 +131,13 @@ func (l *Ledger) Settle(operationID, userID string, total int64) (string, error)
 		return "", ErrInvalidOrder
 	}
 	op.userID = userID
-	op.settle = &settle{total: total, result: Success}
-	return Success, nil
+	result := Success
+	if l.failSettle {
+		result = Failed
+	}
+	op.settle = &settle{result: result}
+	op.settle.total.Set(total)
+	return result, nil
 }
 
 // Void cancels a hold and forbids a late first HOLD. It succeeds without a hold too.

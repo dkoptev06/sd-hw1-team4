@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/google/uuid"
 
@@ -20,77 +21,69 @@ func (w *Worker) sweepLoop(ctx context.Context) {
 	}
 }
 
-// Sweep closes START tasks past their deadline and tasks without attempts left. It
-// repeats batches while they come back full and make progress, so it keeps up with
-// a backlog (for example, every START expiring during a Payment outage).
+// Sweep walks both queues in bounded pages. A fixed database cutoff keeps
+// incoming tasks from extending this pass indefinitely. Each pass advances past
+// locked or failed rows and the next pass revisits them from the beginning.
 func (w *Worker) Sweep(ctx context.Context) error {
+	cutoff, err := w.store.Now(ctx)
+	if err != nil {
+		return err
+	}
+	var firstErr error
+	process := func(tasks []storage.SweepTask) {
+		for _, task := range tasks {
+			var err error
+			if task.Kind == domain.TaskStart {
+				err = w.finalizeStart(ctx, task.OrderID, &task.ID)
+			} else {
+				err = w.deadLetterExhausted(ctx, task.ID)
+			}
+			if err != nil && firstErr == nil {
+				firstErr = fmt.Errorf("finalize %s task %s: %w", task.Kind, task.ID, err)
+			}
+		}
+	}
+
+	var expiredAfter, exhaustedAfter storage.SweepTask
 	for ctx.Err() == nil {
-		more, err := w.sweepBatch(ctx)
-		if err != nil || !more {
-			return err
+		expired, err := w.store.FindStartsPastDeadline(ctx, w.cfg.BatchSize, cutoff, expiredAfter)
+		if err != nil {
+			return errors.Join(firstErr, err)
+		}
+		process(expired)
+		exhausted, err := w.store.FindExhaustedTasks(ctx, w.cfg.BatchSize, w.maxAttempts, cutoff, exhaustedAfter)
+		if err != nil {
+			return errors.Join(firstErr, err)
+		}
+		process(exhausted)
+		if len(expired) < w.cfg.BatchSize && len(exhausted) < w.cfg.BatchSize {
+			return firstErr
+		}
+		if len(expired) > 0 {
+			expiredAfter = expired[len(expired)-1]
+		}
+		if len(exhausted) > 0 {
+			exhaustedAfter = exhausted[len(exhausted)-1]
 		}
 	}
-	return nil
+	return errors.Join(firstErr, ctx.Err())
 }
-
-// sweepBatch handles one batch of each kind and reports whether another batch may
-// have work. Rows locked by another replica or by an attempt being applied are
-// skipped, so replicas split the backlog instead of waiting on the same rows.
-func (w *Worker) sweepBatch(ctx context.Context) (more bool, err error) {
-	expired, err := w.store.FindStartsPastDeadline(ctx, w.cfg.BatchSize)
-	if err != nil {
-		return false, err
-	}
-	var errs []error
-	closed := 0
-	record := func(done bool, err error) {
-		if done {
-			closed++
-		}
-		errs = append(errs, err)
-	}
-	for _, orderID := range expired {
-		record(w.finalizeStart(ctx, orderID, skipLocked))
-	}
-	exhausted, err := w.store.FindExhaustedTasks(ctx, w.cfg.BatchSize, w.maxAttempts)
-	if err != nil {
-		return false, errors.Join(append(errs, err)...)
-	}
-	for _, ref := range exhausted {
-		if ref.Kind == domain.TaskStart {
-			record(w.finalizeStart(ctx, ref.OrderID, skipLocked))
-		} else {
-			record(w.deadLetterExhausted(ctx, ref.ID))
-		}
-	}
-	full := len(expired) == w.cfg.BatchSize || len(exhausted) == w.cfg.BatchSize
-	return full && closed > 0, errors.Join(errs...)
-}
-
-// lockMode tells whether a sweep waits for rows locked by other transactions.
-type lockMode bool
-
-const (
-	waitLocked lockMode = false
-	skipLocked lockMode = true
-)
 
 // FinalizeStart closes a pending START without a new HOLD when its deadline passed
 // or its attempts ran out. It is a no-op when neither holds or another participant
 // already closed the task.
 func (w *Worker) FinalizeStart(ctx context.Context, orderID uuid.UUID) error {
-	_, err := w.finalizeStart(ctx, orderID, waitLocked)
-	return err
+	return w.finalizeStart(ctx, orderID, nil)
 }
 
-// finalizeStart reports whether it closed the task. With skipLocked a locked order
-// counts as nothing to do.
-func (w *Worker) finalizeStart(ctx context.Context, orderID uuid.UUID, mode lockMode) (bool, error) {
+// A sweep supplies the selected task ID and skips locked rows. Explicit
+// finalization waits for the order and then its current START task.
+func (w *Worker) finalizeStart(ctx context.Context, orderID uuid.UUID, sweepTaskID *uuid.UUID) error {
 	var event *taskEvent
 	err := w.store.InTx(ctx, func(q *storage.Queries) error {
 		event = nil
 		lockOrder := q.LockOrder
-		if mode == skipLocked {
+		if sweepTaskID != nil {
 			lockOrder = q.TryLockOrder
 		}
 		order, err := lockOrder(ctx, orderID)
@@ -100,7 +93,12 @@ func (w *Worker) finalizeStart(ctx context.Context, orderID uuid.UUID, mode lock
 		if err != nil {
 			return err
 		}
-		task, err := q.LockStartTask(ctx, orderID)
+		var task domain.Task
+		if sweepTaskID != nil {
+			task, err = q.TryLockTask(ctx, *sweepTaskID)
+		} else {
+			task, err = q.LockStartTask(ctx, orderID)
+		}
 		if errors.Is(err, storage.ErrNotFound) {
 			return nil
 		}
@@ -123,15 +121,15 @@ func (w *Worker) finalizeStart(ctx context.Context, orderID uuid.UUID, mode lock
 		return err
 	})
 	if err != nil {
-		return false, err
+		return err
 	}
 	w.report(event)
-	return event != nil, nil
+	return nil
 }
 
 // deadLetterExhausted moves a SETTLE or VOID without attempts left to DEAD_LETTER
-// and reports whether it did. A task locked by another transaction is skipped.
-func (w *Worker) deadLetterExhausted(ctx context.Context, taskID uuid.UUID) (bool, error) {
+// unless the task is locked by another transaction.
+func (w *Worker) deadLetterExhausted(ctx context.Context, taskID uuid.UUID) error {
 	var event *taskEvent
 	err := w.store.InTx(ctx, func(q *storage.Queries) error {
 		event = nil
@@ -149,14 +147,18 @@ func (w *Worker) deadLetterExhausted(ctx context.Context, taskID uuid.UUID) (boo
 		if !task.Exhausted(now, w.maxAttempts[task.Kind]) {
 			return nil
 		}
-		event = &taskEvent{task: task, status: domain.TaskDeadLetter, lastError: "max attempts exceeded"}
-		return q.DeadLetterTask(ctx, task.ID, "")
+		lastError, err := q.DeadLetterTask(ctx, task.ID, "")
+		if err != nil {
+			return err
+		}
+		event = &taskEvent{task: task, status: domain.TaskDeadLetter, lastError: lastError, cause: "max attempts exceeded"}
+		return nil
 	})
 	if err != nil {
-		return false, err
+		return err
 	}
 	w.report(event)
-	return event != nil, nil
+	return nil
 }
 
 // taskEvent describes a task that reached COMPLETED or DEAD_LETTER.
@@ -166,6 +168,7 @@ type taskEvent struct {
 	result    string
 	reason    domain.Reason
 	lastError string
+	cause     string
 }
 
 // report logs a committed task completion and updates metrics. The log is the
@@ -180,6 +183,9 @@ func (w *Worker) report(e *taskEvent) {
 		"result", e.result, "attempts", e.task.AttemptCount, "completion_reason", e.reason, "last_error", e.lastError,
 	}
 	if e.status == domain.TaskDeadLetter {
+		if e.cause != "" {
+			attrs = append(attrs, "cause", e.cause)
+		}
 		w.log.Error("task moved to dead letter queue", attrs...)
 		return
 	}

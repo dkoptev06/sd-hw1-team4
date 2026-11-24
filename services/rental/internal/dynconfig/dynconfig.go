@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"sync/atomic"
 	"time"
 
@@ -37,6 +38,7 @@ func defaultConfigs() source.Configs {
 	raw.PriceCoeffSettings.Surge = "1.25"
 	raw.PriceCoeffSettings.LowChargeDiscount = "0.8"
 	raw.DefaultRetentionDays = domain.DefaultRetentionDays
+	raw.RetentionDaysByZone = map[string]int{}
 	return raw
 }
 
@@ -50,6 +52,9 @@ func Parse(raw source.Configs) (Snapshot, error) {
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("low_charge_discount: %w", err)
 	}
+	if raw.RetentionDaysByZone == nil {
+		return Snapshot{}, errors.New("retention_days_by_zone must be an object")
+	}
 	retention, err := domain.NewRetention(raw.DefaultRetentionDays, raw.RetentionDaysByZone)
 	if err != nil {
 		return Snapshot{}, err
@@ -60,6 +65,10 @@ func Parse(raw source.Configs) (Snapshot, error) {
 	}
 	if ttlMinutes <= 0 {
 		return Snapshot{}, errors.New("tariff_zone_cache_ttl_minutes must be positive")
+	}
+	const maxTariffTTLMinutes = int(math.MaxInt64 / time.Minute)
+	if ttlMinutes > maxTariffTTLMinutes {
+		return Snapshot{}, fmt.Errorf("tariff_zone_cache_ttl_minutes must not exceed %d", maxTariffTTLMinutes)
 	}
 	return Snapshot{
 		Coefficients: domain.Coefficients{Surge: surge, LowChargeDiscount: discount},

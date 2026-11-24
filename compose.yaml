@@ -6,8 +6,8 @@ x-ready: &ready
   retries: 30
 
 x-rental: &rental
-  build: ./services/rental
-  image: sd-hw1-team4-rental:local
+  image: &rental-image sd-hw1-team4-rental:local
+  pull_policy: never
   restart: unless-stopped
   depends_on:
     migrate:
@@ -43,8 +43,8 @@ services:
       - postgres-data:/var/lib/postgresql/data
 
   migrate:
-    build: ./services/rental
-    image: sd-hw1-team4-rental:local
+    image: *rental-image
+    pull_policy: never
     command: ["migrate"]
     environment: *rental-env
     depends_on:
@@ -53,6 +53,7 @@ services:
 
   rental-api:
     <<: *rental
+    build: ./services/rental
     command: ["api"]
     environment:
       <<: *rental-env
@@ -112,6 +113,7 @@ services:
     restart: unless-stopped
     volumes:
       - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/prometheus/rules:/etc/prometheus/rules:ro
       - prometheus-data:/prometheus
     ports:
       - "127.0.0.1:${PROMETHEUS_PORT:-19090}:9090"

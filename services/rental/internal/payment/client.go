@@ -83,13 +83,17 @@ func (c *Client) command(ctx context.Context, operation string, body any) Result
 
 func classify(resp httpjson.Response, err error) Result {
 	switch {
+	case resp.Status >= 400 && resp.Status < 500:
+		detail := errorBodySnippet(resp.Body)
+		if err != nil {
+			detail = "read body: " + err.Error()
+		}
+		return Result{Outcome: ContractError, Detail: fmt.Sprintf("status %d: %s", resp.Status, detail)}
 	case err != nil:
 		if errors.Is(err, context.DeadlineExceeded) {
 			return Result{Outcome: Transient, Detail: "timeout"}
 		}
 		return Result{Outcome: Transient, Detail: err.Error()}
-	case resp.Status >= 400 && resp.Status < 500:
-		return Result{Outcome: ContractError, Detail: fmt.Sprintf("status %d: %s", resp.Status, truncate(resp.Body))}
 	case resp.Status != http.StatusOK:
 		return Result{Outcome: Transient, Detail: fmt.Sprintf("status %d", resp.Status)}
 	}
@@ -109,10 +113,9 @@ func classify(resp httpjson.Response, err error) Result {
 	}
 }
 
-func truncate(body []byte) string {
+// PostgreSQL text requires valid UTF-8 and excludes NUL. The byte limit can split a rune.
+func errorBodySnippet(body []byte) string {
 	const limit = 200
-	if len(body) > limit {
-		return string(body[:limit])
-	}
-	return string(body)
+	snippet := strings.ToValidUTF8(string(body[:min(len(body), limit)]), "?")
+	return strings.ReplaceAll(snippet, "\x00", "?")
 }

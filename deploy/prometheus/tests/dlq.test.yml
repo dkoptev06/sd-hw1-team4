@@ -1,0 +1,62 @@
+rule_files:
+  - ../rules/dlq.yml
+
+evaluation_interval: 5s
+
+tests:
+  - name: "Первое попадание в DLQ видно с любой реплики и остаётся видимым после возврата задачи"
+    interval: 5s
+    input_series:
+      - series: 'rental_tasks_finished_total{job="rental-worker",instance="first",kind="SETTLE",status="DEAD_LETTER",reason=""}'
+        values: '0+0x30'
+      - series: 'rental_tasks_finished_total{job="rental-worker",instance="second",kind="SETTLE",status="DEAD_LETTER",reason=""}'
+        values: '0 1+0x29'
+      - series: 'rental_tasks{job="rental-maintenance",instance="first",kind="SETTLE",status="DEAD_LETTER"}'
+        values: '0 1 0+0x28'
+    alert_rule_test:
+      - eval_time: 0s
+        alertname: RentalTaskDeadLettered
+        exp_alerts: []
+      - eval_time: 5s
+        alertname: RentalTaskDeadLettered
+        exp_alerts:
+          - exp_labels: {kind: SETTLE, severity: warning}
+            exp_annotations:
+              summary: "Задачи SETTLE попали в DLQ"
+              description: "Проверьте причину через rental dlq list и в журнале worker."
+      - eval_time: 30s
+        alertname: RentalTaskDeadLettered
+        exp_alerts:
+          - exp_labels: {kind: SETTLE, severity: warning}
+            exp_annotations:
+              summary: "Задачи SETTLE попали в DLQ"
+              description: "Проверьте причину через rental dlq list и в журнале worker."
+      - eval_time: 2m10s
+        alertname: RentalTaskDeadLettered
+        exp_alerts: []
+
+  - name: "Сброс счётчика не создаёт алерт, а оставшиеся задачи видны по состоянию БД"
+    interval: 5s
+    input_series:
+      - series: 'rental_tasks_finished_total{job="rental-worker",instance="first",kind="SETTLE",status="DEAD_LETTER",reason=""}'
+        values: '3+0x2 0+0x27'
+      - series: 'rental_tasks_finished_total{job="rental-worker",instance="first",kind="START",status="COMPLETED",reason="CONTRACT_ERROR"}'
+        values: '0+1x30'
+      - series: 'rental_tasks{job="rental-maintenance",instance="first",kind="VOID",status="DEAD_LETTER"}'
+        values: '0 1+0x28 0'
+      - series: 'rental_tasks{job="rental-maintenance",instance="second",kind="VOID",status="DEAD_LETTER"}'
+        values: '0 1+0x28 0'
+    alert_rule_test:
+      - eval_time: 0s
+        alertname: RentalTaskDeadLettered
+        exp_alerts: []
+      - eval_time: 2m15s
+        alertname: RentalTaskDeadLettered
+        exp_alerts:
+          - exp_labels: {kind: VOID, severity: warning}
+            exp_annotations:
+              summary: "Задачи VOID попали в DLQ"
+              description: "Проверьте причину через rental dlq list и в журнале worker."
+      - eval_time: 2m30s
+        alertname: RentalTaskDeadLettered
+        exp_alerts: []

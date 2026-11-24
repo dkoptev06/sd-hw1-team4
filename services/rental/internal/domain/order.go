@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"math/big"
 	"time"
 
 	"github.com/google/uuid"
@@ -40,7 +41,7 @@ type Order struct {
 	FinishTime  *time.Time
 	ClosedAt    *time.Time
 	DeleteAfter *time.Time
-	Cost        *int64
+	Cost        *big.Int
 }
 
 // NewOrder creates a STARTING order with the offer's terms.
@@ -59,12 +60,11 @@ func NewOrder(offer Offer, now time.Time) Order {
 
 // CostAt is the cost shown to the client: undefined while STARTING, calculated
 // on read while ACTIVE and fixed afterwards.
-func (o Order) CostAt(now time.Time) *int64 {
+func (o Order) CostAt(now time.Time) (*big.Int, error) {
 	if o.Status == OrderActive && o.StartedAt != nil {
-		cost := TripCost(o.Terms, now.Sub(*o.StartedAt))
-		return &cost
+		return TripCost(o.Terms, *o.StartedAt, now)
 	}
-	return o.Cost
+	return o.Cost, nil
 }
 
 // CanBeReplacedAt reports whether a new start may close this order because its start deadline passed.
@@ -73,10 +73,13 @@ func (o Order) CanBeReplacedAt(now time.Time, startDeadline time.Time) bool {
 }
 
 // FinishOutcome calculates the final status and cost of an ACTIVE trip.
-func FinishOutcome(terms Terms, startedAt, finishedAt time.Time) (OrderStatus, int64) {
-	elapsed := finishedAt.Sub(startedAt)
-	if elapsed < MinBillableDuration {
-		return OrderCancelled, 0
+func FinishOutcome(terms Terms, startedAt, finishedAt time.Time) (OrderStatus, *big.Int, error) {
+	if finishedAt.Before(startedAt.Add(MinBillableDuration)) {
+		return OrderCancelled, new(big.Int), nil
 	}
-	return OrderCompleted, TripCost(terms, elapsed)
+	cost, err := TripCost(terms, startedAt, finishedAt)
+	if err != nil {
+		return "", nil, err
+	}
+	return OrderCompleted, cost, nil
 }

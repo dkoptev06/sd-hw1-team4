@@ -2,6 +2,9 @@ global:
   scrape_interval: 5s
   evaluation_interval: 5s
 
+rule_files:
+  - rules/*.yml
+
 # dns_sd_configs resolves every replica of a Compose service.
 scrape_configs:
   - job_name: rental-api

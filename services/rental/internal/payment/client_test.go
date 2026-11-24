@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -39,6 +40,35 @@ func TestClassification(t *testing.T) {
 	}
 }
 
+func TestIncompleteResponseBody(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		want       Outcome
+	}{
+		{name: "4xx stays a contract error", statusCode: http.StatusConflict, want: ContractError},
+		{name: "200 stays indeterminate", statusCode: http.StatusOK, want: Transient},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Length", "64")
+				w.WriteHeader(test.statusCode)
+				_ = json.NewEncoder(w).Encode(map[string]string{"status": "success"})
+			}))
+			defer server.Close()
+			client := NewClient(server.URL, httpjson.NewClient(), time.Second)
+			got := client.Void(t.Context(), domain.VoidParams{OperationID: "op"})
+			if got.Outcome != test.want {
+				t.Fatalf("outcome = %s (%s), want %s", got.Outcome, got.Detail, test.want)
+			}
+			if test.want == ContractError && !strings.HasPrefix(got.Detail, "status 409:") {
+				t.Fatalf("response status missing from error: %s", got.Detail)
+			}
+		})
+	}
+}
+
 func TestHoldRequest(t *testing.T) {
 	expires := time.Date(2026, 11, 24, 13, 2, 0, 0, time.UTC)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -63,5 +93,21 @@ func reply(status int, body string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(status)
 		_, _ = w.Write([]byte(body))
+	}
+}
+
+func TestContractErrorBodyIsStorableText(t *testing.T) {
+	for _, test := range []struct{ name, body, want string }{
+		{name: "localized", body: "ошибка", want: "ошибка"},
+		{name: "truncated rune", body: strings.Repeat("a", 199) + "я", want: strings.Repeat("a", 199) + "?"},
+		{name: "zero byte", body: "a\x00b", want: "a?b"},
+		{name: "invalid UTF-8", body: "a\xffb", want: "a?b"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := classify(httpjson.Response{Status: http.StatusConflict, Body: []byte(test.body)}, nil)
+			if got.Outcome != ContractError || got.Detail != "status 409: "+test.want {
+				t.Fatalf("unexpected Payment result: %+v", got)
+			}
+		})
 	}
 }

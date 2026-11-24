@@ -25,14 +25,14 @@ func NewClient() *http.Client {
 	return &http.Client{Transport: transport}
 }
 
-// Response is a fully read HTTP response.
+// Response contains the HTTP status and the body bytes that were read.
 type Response struct {
 	Status int
 	Body   []byte
 }
 
 // Do sends a request with an optional JSON body and reads the whole response.
-// A non-nil error means no HTTP response was received (network error or timeout).
+// If reading the body fails, Do returns the HTTP status and the read error.
 func Do(ctx context.Context, client *http.Client, method, url string, body any) (Response, error) {
 	var reader io.Reader
 	if body != nil {
@@ -55,8 +55,5 @@ func Do(ctx context.Context, client *http.Client, method, url string, body any) 
 	}
 	defer resp.Body.Close()
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return Response{}, err
-	}
-	return Response{Status: resp.StatusCode, Body: data}, nil
+	return Response{Status: resp.StatusCode, Body: data}, err
 }

@@ -20,8 +20,10 @@ import (
 var (
 	// ErrNotFound means Source answered 404 for the requested ID.
 	ErrNotFound = errors.New("source: not found")
-	// ErrUnavailable means Source failed, timed out or broke its contract.
+	// ErrUnavailable means Source returned a server error or could not be reached or read.
 	ErrUnavailable = errors.New("source: unavailable")
+	// ErrInvalidResponse means Source returned an unexpected status or invalid data.
+	ErrInvalidResponse = errors.New("source: invalid response")
 )
 
 // Configs is the raw /configs response; dynconfig validates it.
@@ -56,11 +58,11 @@ func (c *Client) Scooter(ctx context.Context, id string) (domain.Scooter, error)
 		return domain.Scooter{}, err
 	}
 	if body.Charge == nil {
-		return domain.Scooter{}, fmt.Errorf("%w: scooter without charge", ErrUnavailable)
+		return domain.Scooter{}, fmt.Errorf("%w: scooter without charge", ErrInvalidResponse)
 	}
 	scooter := domain.Scooter{ID: body.ID, ZoneID: body.ZoneID, Charge: *body.Charge}
 	if err := scooter.Validate(); err != nil || scooter.ID != id {
-		return domain.Scooter{}, fmt.Errorf("%w: invalid scooter %q: %v", ErrUnavailable, id, err)
+		return domain.Scooter{}, fmt.Errorf("%w: invalid scooter %q: %v", ErrInvalidResponse, id, err)
 	}
 	return scooter, nil
 }
@@ -76,14 +78,14 @@ func (c *Client) TariffZone(ctx context.Context, id string) (domain.Tariff, erro
 		return domain.Tariff{}, err
 	}
 	if body.PricePerMinute == nil || body.PriceUnlock == nil || body.DefaultDeposit == nil {
-		return domain.Tariff{}, fmt.Errorf("%w: tariff zone %q has missing prices", ErrUnavailable, id)
+		return domain.Tariff{}, fmt.Errorf("%w: tariff zone %q has missing prices", ErrInvalidResponse, id)
 	}
 	tariff := domain.Tariff{
 		ZoneID: body.ID, PricePerMinute: *body.PricePerMinute,
 		PriceUnlock: *body.PriceUnlock, DefaultDeposit: *body.DefaultDeposit,
 	}
 	if err := tariff.Validate(); err != nil || tariff.ZoneID != id {
-		return domain.Tariff{}, fmt.Errorf("%w: invalid tariff zone %q: %v", ErrUnavailable, id, err)
+		return domain.Tariff{}, fmt.Errorf("%w: invalid tariff zone %q: %v", ErrInvalidResponse, id, err)
 	}
 	return tariff, nil
 }
@@ -98,7 +100,7 @@ func (c *Client) UserProfile(ctx context.Context, id string) (domain.UserProfile
 		return domain.UserProfile{}, err
 	}
 	if body.ID != id || body.HasSubscription == nil || body.Trusted == nil {
-		return domain.UserProfile{}, fmt.Errorf("%w: invalid user profile %q", ErrUnavailable, id)
+		return domain.UserProfile{}, fmt.Errorf("%w: invalid user profile %q", ErrInvalidResponse, id)
 	}
 	return domain.UserProfile{UserID: id, HasSubscription: *body.HasSubscription, Trusted: *body.Trusted}, nil
 }
@@ -126,18 +128,26 @@ func (c *Client) get(ctx context.Context, operation, path string, timeout time.D
 
 func classify(resp httpjson.Response, err error, out any) (string, error) {
 	switch {
+	case resp.Status == http.StatusNotFound:
+		return "not_found", ErrNotFound
+	case resp.Status != 0 && resp.Status != http.StatusOK:
+		// A received status determines the outcome even when reading its error body failed.
+		cause := ErrInvalidResponse
+		if resp.Status >= 500 && resp.Status < 600 {
+			cause = ErrUnavailable
+		}
+		return fmt.Sprintf("http_%d", resp.Status), fmt.Errorf("%w: status %d", cause, resp.Status)
 	case err != nil:
+		if errors.Is(err, context.Canceled) {
+			return "canceled", err
+		}
 		if errors.Is(err, context.DeadlineExceeded) {
 			return "timeout", fmt.Errorf("%w: %v", ErrUnavailable, err)
 		}
 		return "network_error", fmt.Errorf("%w: %v", ErrUnavailable, err)
-	case resp.Status == http.StatusNotFound:
-		return "not_found", ErrNotFound
-	case resp.Status != http.StatusOK:
-		return fmt.Sprintf("http_%d", resp.Status), fmt.Errorf("%w: status %d", ErrUnavailable, resp.Status)
 	}
 	if err := json.Unmarshal(resp.Body, out); err != nil {
-		return "invalid_body", fmt.Errorf("%w: decode body: %v", ErrUnavailable, err)
+		return "invalid_body", fmt.Errorf("%w: decode body: %v", ErrInvalidResponse, err)
 	}
 	return "ok", nil
 }

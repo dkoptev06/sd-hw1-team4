@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/big"
 	"sync"
 	"testing"
 	"time"
@@ -272,7 +273,7 @@ func TestExpiredStartIsReplaced(t *testing.T) {
 		t.Fatalf("replacement %+v", replacement)
 	}
 	old, err := env.orders.Get(ctx, previous.OrderID)
-	if err != nil || old.Order.Status != domain.OrderStartFailed || old.Cost == nil || *old.Cost != 0 {
+	if err != nil || old.Order.Status != domain.OrderStartFailed || old.Cost == nil || old.Cost.Sign() != 0 {
 		t.Fatalf("previous order %+v err=%v", old, err)
 	}
 	if days := old.Order.DeleteAfter.Sub(*old.Order.ClosedAt).Hours() / 24; days != 30 {
@@ -285,6 +286,83 @@ func TestExpiredStartIsReplaced(t *testing.T) {
 		FROM tasks WHERE order_id = $1 AND task_type = 'START'`, previous.OrderID).Scan(&taskStatus, &voids)
 	if err != nil || taskStatus != "PENDING" || voids != 0 {
 		t.Fatalf("API must leave the START task to the worker: %s voids=%d err=%v", taskStatus, voids, err)
+	}
+}
+
+func TestStartRejectsOfferThatExpiresWhileWaitingForOrderLock(t *testing.T) {
+	env := newOrderEnv(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	previous := env.start(t, env.offer(t, "scooter", "zone-1").ID)
+	next := env.offer(t, "scooter", "zone-1")
+	testdb.Exec(t, env.store, `UPDATE tasks SET deadline_at = clock_timestamp() WHERE order_id = $1`, previous.OrderID)
+
+	tx, err := env.store.Pool().Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(context.Background())
+	var lockerPID int32
+	err = tx.QueryRow(ctx, `SELECT pg_backend_pid() FROM orders WHERE order_id = $1 FOR UPDATE`, previous.OrderID).Scan(&lockerPID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var expiresAt time.Time
+	err = env.store.Pool().QueryRow(ctx, `
+		UPDATE offers SET expires_at = clock_timestamp() + interval '2 seconds'
+		WHERE offer_id = $1 RETURNING expires_at`, next.ID).Scan(&expiresAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		_, err := env.orders.Start(ctx, next.ID)
+		result <- err
+	}()
+
+	// Observe the lock wait before letting the offer expire.
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		var blocked bool
+		err := env.store.Pool().QueryRow(ctx, `
+			SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE $1::integer = ANY(pg_blocking_pids(pid)))`, lockerPID).
+			Scan(&blocked)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if blocked {
+			break
+		}
+		select {
+		case err := <-result:
+			t.Fatalf("start returned without waiting for the order lock: %v", err)
+		case <-ctx.Done():
+			t.Fatal("start did not wait for the order lock")
+		case <-ticker.C:
+		}
+	}
+
+	if _, err := env.store.Pool().Exec(ctx, `SELECT pg_sleep_until($1)`, expiresAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-result; !errors.Is(err, domain.ErrOfferExpired) {
+		t.Fatalf("start after waiting past the offer expiration: %v", err)
+	}
+	stored, err := env.store.GetOffer(ctx, next.ID)
+	if err != nil || stored.Status != domain.OfferAvailable {
+		t.Fatalf("offer changed after rejected start: %+v, %v", stored, err)
+	}
+	if _, err := env.store.FindOrderByOffer(ctx, next.ID); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("rejected start left an order: %v", err)
+	}
+	old, err := env.orders.Get(ctx, previous.OrderID)
+	if err != nil || old.Order.Status != domain.OrderStarting {
+		t.Fatalf("rejected start changed previous order: %+v, %v", old, err)
 	}
 }
 
@@ -302,16 +380,19 @@ func TestFinish(t *testing.T) {
 	env.activate(t, started.OrderID, 61*time.Second)
 	view, err := env.orders.Get(ctx, started.OrderID)
 	// minute rate floor(60 × 1.25) = 75; cost 50 + floor(61 × 75 / 60) = 126; the read may run a second later.
-	if err != nil || view.Order.Status != domain.OrderActive || view.Cost == nil || *view.Cost < 126 || *view.Cost > 127 {
+	if err != nil || view.Order.Status != domain.OrderActive || view.Cost == nil ||
+		view.Cost.Cmp(big.NewInt(126)) < 0 || view.Cost.Cmp(big.NewInt(127)) > 0 {
 		t.Fatalf("active view %+v cost %v err=%v", view, view.Cost, err)
 	}
 
 	finished, err := env.orders.Finish(ctx, started.OrderID)
-	if err != nil || finished.Status != domain.OrderCompleted || *finished.Cost < 126 || finished.FinishTime == nil {
+	if err != nil || finished.Status != domain.OrderCompleted || finished.Cost == nil ||
+		finished.Cost.Cmp(big.NewInt(126)) < 0 || finished.FinishTime == nil {
 		t.Fatalf("finish %+v err=%v", finished, err)
 	}
 	replay, err := env.orders.Finish(ctx, started.OrderID)
-	if err != nil || *replay.Cost != *finished.Cost || !replay.FinishTime.Equal(*finished.FinishTime) {
+	if err != nil || replay.Cost == nil || replay.Cost.Cmp(finished.Cost) != 0 ||
+		replay.FinishTime == nil || !replay.FinishTime.Equal(*finished.FinishTime) {
 		t.Fatalf("replay %+v err=%v", replay, err)
 	}
 
@@ -320,49 +401,76 @@ func TestFinish(t *testing.T) {
 	err = env.store.Pool().QueryRow(ctx, `
 		SELECT parameters, (SELECT count(*) FROM tasks WHERE order_id = $1 AND task_type = 'SETTLE')
 		FROM tasks WHERE order_id = $1 AND task_type = 'SETTLE'`, started.OrderID).Scan(&settle, &settles)
-	if err != nil || settles != 1 || settle.TotalAmount != *finished.Cost || settle.OperationID != started.OrderID.String() {
+	if err != nil || settles != 1 || settle.TotalAmount == nil ||
+		settle.TotalAmount.Cmp(finished.Cost) != 0 || settle.OperationID != started.OrderID.String() {
 		t.Fatalf("SETTLE %+v count=%d err=%v", settle, settles, err)
 	}
 
 	short := env.start(t, env.offer(t, "s-short", "zone-1").ID)
 	env.activate(t, short.OrderID, 2*time.Second)
 	cancelled, err := env.orders.Finish(ctx, short.OrderID)
-	if err != nil || cancelled.Status != domain.OrderCancelled || *cancelled.Cost != 0 {
+	if err != nil || cancelled.Status != domain.OrderCancelled || cancelled.Cost == nil || cancelled.Cost.Sign() != 0 {
 		t.Fatalf("short trip %+v err=%v", cancelled, err)
 	}
 }
 
-// A start repeated after the order and its offer were archived finds the order in
-// the history; an unknown offer is NOT_FOUND.
-func TestStartReplayAfterArchive(t *testing.T) {
-	env := newOrderEnv(t)
-	ctx := context.Background()
-	offer := env.offer(t, "s", "zone-1")
-	started := env.start(t, offer.ID)
-	env.activate(t, started.OrderID, time.Minute)
-	if _, err := env.orders.Finish(ctx, started.OrderID); err != nil {
+// archiveOrder finishes a trip and moves it to history after all of its tasks are done.
+func (e *orderEnv) archiveOrder(t *testing.T, ctx context.Context, orderID uuid.UUID) {
+	t.Helper()
+	e.activate(t, orderID, time.Minute)
+	if _, err := e.orders.Finish(ctx, orderID); err != nil {
 		t.Fatal(err)
 	}
-	testdb.Exec(t, env.store, `DELETE FROM tasks WHERE order_id = $1`, started.OrderID)
-	weeks, err := env.store.ArchiveCandidateWeeks(ctx, 10)
+	testdb.Exec(t, e.store, `DELETE FROM tasks WHERE order_id = $1`, orderID)
+	weeks, err := e.store.ArchiveCandidateWeeks(ctx, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, week := range weeks {
-		if err := env.store.CreatePartition(ctx, week); err != nil {
+		if err := e.store.CreatePartition(ctx, week); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if _, archived, err := env.store.ArchiveOrders(ctx, 10); err != nil || archived != 1 {
+	if _, archived, err := e.store.ArchiveOrders(ctx, 10, weeks); err != nil || archived != 1 {
 		t.Fatalf("archive: %d %v", archived, err)
 	}
+}
 
-	replay, err := env.orders.Start(ctx, offer.ID)
+func TestStartReplayAfterArchive(t *testing.T) {
+	env := newOrderEnv(t)
+	ctx := context.Background()
+	offered := env.offer(t, "s", "zone-1")
+	started := env.start(t, offered.ID)
+	env.archiveOrder(t, ctx, started.OrderID)
+
+	env.orders.scooters = scootersFunc(func(context.Context, string) (domain.Scooter, error) {
+		t.Fatal("a replay must not call Source")
+		return domain.Scooter{}, source.ErrUnavailable
+	})
+	replay, err := env.orders.Start(ctx, offered.ID)
 	if err != nil || !replay.Replayed || replay.OrderID != started.OrderID || replay.Status != domain.OrderCompleted {
 		t.Fatalf("replay after archive %+v err=%v", replay, err)
 	}
 	if _, err := env.orders.Start(ctx, uuid.New()); !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("unknown offer: %v", err)
+	}
+}
+
+func TestStartReplayWhenSourceFailsDuringArchive(t *testing.T) {
+	env := newOrderEnv(t)
+	offered := env.offer(t, "s", "zone-1")
+
+	var created StartResult
+	service := *env.orders
+	service.scooters = scootersFunc(func(ctx context.Context, _ string) (domain.Scooter, error) {
+		// A second request can finish and archive its order while the first is waiting for Source.
+		created = env.start(t, offered.ID)
+		env.archiveOrder(t, ctx, created.OrderID)
+		return domain.Scooter{}, source.ErrUnavailable
+	})
+	replay, err := service.Start(context.Background(), offered.ID)
+	if err != nil || !replay.Replayed || replay.OrderID != created.OrderID || replay.Status != domain.OrderCompleted {
+		t.Fatalf("replay when Source fails after archiving %+v err=%v", replay, err)
 	}
 }
 

@@ -40,11 +40,14 @@ services/rental/internal/
 | --- | --- |
 | `make` / `make check` | Юнит-тесты с `-race`, `go vet`, сборка в `build/` |
 | `make db-up` | Поднять только PostgreSQL из Compose |
-| `make test-integration` | Все тесты Rental, включая интеграционные на PostgreSQL (адрес берётся из `RENTAL_TEST_DATABASE_URL`, по умолчанию — PostgreSQL из compose) |
+| `make test-integration` | Интеграционные тесты Rental на PostgreSQL (адрес берётся из `RENTAL_TEST_DATABASE_URL`, по умолчанию используется PostgreSQL из Compose) |
+| `make test-functional` | Функциональные сценарии из тест-плана через HTTP на отдельной схеме PostgreSQL |
 | `make up` / `make down` | Собрать и поднять / остановить весь стенд |
 | `make logs` | Логи процессов Rental |
 
 Интеграционные тесты создают собственную схему и удаляют её после себя. Без `RENTAL_TEST_DATABASE_URL` они пропускаются.
+
+Для функциональных тестов запустите `make db-up` и `make test-functional`. Они запускают процессы Rental и тестовые зависимости на свободных локальных портах. У каждого сценария свой пакет в `services/rental/tests/`. Общие фикстуры и вспомогательный код для запуска стенда находятся в пакете `tests`. Название сценария и ссылка на соответствующий раздел [тест-плана](docs/TEST_PLAN.md) указаны в его `scenario_test.go`.
 
 ## Стенд
 
@@ -68,6 +71,16 @@ curl localhost:18080/orders/<order_id>
 curl -X POST localhost:18080/orders/<order_id>/finish
 ```
 
+## Оповещение о DLQ
+
+Алерт `RentalTaskDeadLettered` срабатывает отдельно для SETTLE и VOID, если за последние две минуты были попадания в DLQ или в очереди остаются задачи этого типа. Причину можно посмотреть через `rental dlq list` и в журнале worker. [Вкладка Alerts в Prometheus](http://localhost:19090/alerts)
+
+Чтобы проверить правило, выполните команду из корня проекта.
+
+```sh
+docker run --rm --entrypoint /bin/promtool -v "$PWD/deploy/prometheus:/rules:ro" prom/prometheus:v3.5.0 test rules /rules/tests/dlq.test.yml
+```
+
 ## Настройки Rental
 
 Обязательна только `DATABASE_URL`. Остальные переменные имеют значения по умолчанию, полный список — в [settings.go](services/rental/internal/settings/settings.go). Основные:
@@ -80,3 +93,5 @@ curl -X POST localhost:18080/orders/<order_id>/finish
 | `WORKER_CONCURRENCY`, `WORKER_POLL_INTERVAL` | `64`, `100ms` | Параллелизм и опрос очереди |
 | `START_MAX_ATTEMPTS`, `SETTLE_MAX_ATTEMPTS`, `VOID_MAX_ATTEMPTS` | `5`, `20`, `20` | Лимиты попыток |
 | `MAINTENANCE_INTERVAL`, `MAINTENANCE_BATCH_SIZE` | `1m`, `2000` | Период и размер пачки обслуживания |
+
+При запуске заглушки Payment с `PAYMENT_SETTLE_RESULT=failed` валидный SETTLE фиксирует долг (`DEBT`). По умолчанию результат SETTLE — `success`.

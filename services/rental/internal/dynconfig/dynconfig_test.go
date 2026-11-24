@@ -36,14 +36,33 @@ func TestParse(t *testing.T) {
 		t.Fatalf("unexpected snapshot %+v", snapshot)
 	}
 	for _, body := range []string{
-		`{"price_coeff_settings":{"surge":0,"low_charge_discount":0.8},"default_retention_days":365}`,
-		`{"price_coeff_settings":{"surge":1.2},"default_retention_days":365}`,
-		`{"price_coeff_settings":{"surge":1.2,"low_charge_discount":0.8},"default_retention_days":0}`,
-		`{"price_coeff_settings":{"surge":1.2,"low_charge_discount":0.8},"default_retention_days":365,"tariff_zone_cache_ttl_minutes":0}`,
+		`{"price_coeff_settings":{"surge":0,"low_charge_discount":0.8},"default_retention_days":365,"retention_days_by_zone":{}}`,
+		`{"price_coeff_settings":{"surge":1.2},"default_retention_days":365,"retention_days_by_zone":{}}`,
+		`{"price_coeff_settings":{"surge":1.2,"low_charge_discount":0.8},"default_retention_days":0,"retention_days_by_zone":{}}`,
+		`{"price_coeff_settings":{"surge":1.2,"low_charge_discount":0.8},"default_retention_days":365,"retention_days_by_zone":{},"tariff_zone_cache_ttl_minutes":0}`,
 	} {
 		if _, err := Parse(raw(t, body)); err == nil {
 			t.Errorf("accepted %s", body)
 		}
+	}
+}
+
+func TestParseTariffTTLBoundary(t *testing.T) {
+	cfg := defaultConfigs()
+	// This is the largest whole number of minutes representable by time.Duration.
+	minutes := 153_722_867
+	cfg.TariffZoneCacheTTLMinutes = &minutes
+	snapshot, err := Parse(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := time.Duration(minutes) * time.Minute; snapshot.TariffTTL != want {
+		t.Fatalf("TariffTTL = %v, want %v", snapshot.TariffTTL, want)
+	}
+
+	minutes++
+	if _, err := Parse(cfg); err == nil {
+		t.Fatalf("accepted overflowing tariff TTL of %d minutes", minutes)
 	}
 }
 
@@ -68,15 +87,46 @@ func TestProviderKeepsLastValid(t *testing.T) {
 	}
 
 	fail = nil
-	next = raw(t, `{"price_coeff_settings":{"surge":1.5,"low_charge_discount":0.8},"default_retention_days":30}`)
+	overflowing := raw(t, `{"price_coeff_settings":{"surge":2,"low_charge_discount":0.8},
+		"default_retention_days":10,"retention_days_by_zone":{},"tariff_zone_cache_ttl_minutes":153722868}`)
+	next = overflowing
+	if err := provider.Refresh(context.Background()); err == nil {
+		t.Fatal("overflowing tariff TTL accepted at cold start")
+	}
+	if got := provider.Current(); got.TariffTTL != defaults.TariffTTL ||
+		got.Coefficients.Surge.Cmp(defaults.Coefficients.Surge) != 0 ||
+		got.Retention.DefaultDays() != defaults.Retention.DefaultDays() {
+		t.Fatalf("overflowing tariff TTL replaced defaults: %+v", got)
+	}
+
+	valid := raw(t, `{"price_coeff_settings":{"surge":1.5,"low_charge_discount":0.8},
+		"default_retention_days":365,"retention_days_by_zone":{"zone-2":30},"tariff_zone_cache_ttl_minutes":7}`)
+	next = valid
 	if err := provider.Refresh(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	next = raw(t, `{"price_coeff_settings":{"surge":-1,"low_charge_discount":0.8},"default_retention_days":30}`)
-	if err := provider.Refresh(context.Background()); err == nil {
-		t.Fatal("invalid config accepted")
+	for _, invalid := range []source.Configs{
+		raw(t, `{"price_coeff_settings":{"surge":-1,"low_charge_discount":0.8},"default_retention_days":30,"retention_days_by_zone":{}}`),
+		raw(t, `{"price_coeff_settings":{"surge":2,"low_charge_discount":0.5},"default_retention_days":10,"retention_days_by_zone":null}`),
+		raw(t, `{"price_coeff_settings":{"surge":2,"low_charge_discount":0.5},"default_retention_days":10}`),
+		overflowing,
+	} {
+		next = invalid
+		if err := provider.Refresh(context.Background()); err == nil {
+			t.Fatalf("invalid config accepted: %+v", invalid)
+		}
+		if got := provider.Current(); got.Coefficients.Surge.FloatString(1) != "1.5" ||
+			got.Coefficients.LowChargeDiscount.FloatString(1) != "0.8" || got.Retention.DefaultDays() != 365 ||
+			got.Retention.DaysByZone()["zone-2"] != 30 || got.TariffTTL != 7*time.Minute {
+			t.Fatalf("last valid config lost: %+v", got)
+		}
 	}
-	if got := provider.Current(); got.Coefficients.Surge.FloatString(1) != "1.5" || got.Retention.DefaultDays() != 30 {
-		t.Fatalf("last valid config lost: %+v", got)
+	next = valid
+	next.RetentionDaysByZone = map[string]int{}
+	if err := provider.Refresh(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if zones := provider.Current().Retention.DaysByZone(); len(zones) != 0 {
+		t.Fatalf("empty object should clear zone overrides, got %v", zones)
 	}
 }

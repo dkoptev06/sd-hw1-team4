@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
+	"math/big"
 	"net/http"
 	"os"
 	"strings"
@@ -24,8 +26,12 @@ func Run(ctx context.Context) error {
 	if addr == "" {
 		addr = ":8080"
 	}
+	settleResult := os.Getenv("PAYMENT_SETTLE_RESULT")
+	if settleResult != "" && settleResult != ledger.Success && settleResult != ledger.Failed {
+		return fmt.Errorf("invalid PAYMENT_SETTLE_RESULT %q", settleResult)
+	}
 	slog.Info("serving Payment stub", "addr", addr)
-	return start(ctx, addr, NewRouter(ledger.New(time.Now)))
+	return start(ctx, addr, NewRouter(ledger.New(time.Now, settleResult == ledger.Failed)))
 }
 
 type holdRequest struct {
@@ -36,9 +42,9 @@ type holdRequest struct {
 }
 
 type settleRequest struct {
-	OperationID string `json:"operation_id"`
-	UserID      string `json:"user_id"`
-	TotalAmount int64  `json:"total_amount"`
+	OperationID string   `json:"operation_id"`
+	UserID      string   `json:"user_id"`
+	TotalAmount *big.Int `json:"total_amount"`
 }
 
 type voidRequest struct {

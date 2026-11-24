@@ -12,6 +12,42 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
+// WithMaintenanceLock guards a maintenance cycle on the same PostgreSQL session
+// that runs its statements. An expired lease cannot grant a second cycle while
+// the first session is still running, even if its client process has stopped.
+func (s *Store) WithMaintenanceLock(ctx context.Context, name string, run func(*Queries) error) (bool, error) {
+	conn, err := s.pool.Acquire(ctx)
+	if err != nil {
+		return false, err
+	}
+	// The lease table OID scopes the lock to the resolved schema in this database.
+	const key = "hashtextextended($1, 'maintenance_leases'::regclass::oid::bigint)"
+	var lockChecked, held bool
+	defer func() {
+		if lockChecked && !held {
+			conn.Release()
+			return
+		}
+		cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		var unlocked bool
+		if held && conn.QueryRow(cleanup, "SELECT pg_advisory_unlock("+key+")", name).Scan(&unlocked) == nil && unlocked {
+			conn.Release()
+			return
+		}
+		// If we cannot confirm the lock was released, discard the session.
+		_ = conn.Hijack().Close(cleanup)
+	}()
+	if err := conn.QueryRow(ctx, "SELECT pg_try_advisory_lock("+key+")", name).Scan(&held); err != nil {
+		return false, err
+	}
+	lockChecked = true
+	if !held {
+		return false, nil
+	}
+	return true, run(&Queries{db: conn})
+}
+
 // AcquireLease takes or extends a named lease for holder. It returns false while
 // another holder has a live lease.
 func (q *Queries) AcquireLease(ctx context.Context, name string, holder uuid.UUID, duration time.Duration) (bool, error) {
@@ -48,12 +84,16 @@ func (q *Queries) PurgeCompletedTasks(ctx context.Context, limit int) (int64, er
 const archiveCandidates = `
 	SELECT o.order_id, o.delete_after FROM orders o
 	WHERE o.closed_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.order_id = o.order_id)
-	ORDER BY o.closed_at, o.order_id LIMIT $1`
+		AND (o.delete_after <= clock_timestamp() OR NOT EXISTS (
+			SELECT 1 FROM history_partition_cleanup j
+			WHERE j.week_start = date_trunc('week', o.delete_after, 'UTC')))`
+
+const oldestArchiveCandidates = ` ORDER BY o.closed_at, o.order_id LIMIT $1`
 
 // ArchiveCandidateWeeks returns the history weeks the next archive batch will write to.
 func (q *Queries) ArchiveCandidateWeeks(ctx context.Context, limit int) ([]time.Time, error) {
 	rows, err := q.db.Query(ctx, `
-		SELECT DISTINCT c.delete_after FROM (`+archiveCandidates+`) c
+		SELECT DISTINCT c.delete_after FROM (`+archiveCandidates+oldestArchiveCandidates+`) c
 		WHERE c.delete_after > clock_timestamp()`, limit)
 	if err != nil {
 		return nil, err
@@ -76,9 +116,11 @@ func (q *Queries) ArchiveCandidateWeeks(ctx context.Context, limit int) ([]time.
 // ArchiveOrders moves up to limit closed orders without tasks to orders_history
 // and deletes them with their offers in one statement. Orders whose delete_after
 // already passed are deleted without archiving. The history partitions must exist.
-func (q *Queries) ArchiveOrders(ctx context.Context, limit int) (removed, archived int64, err error) {
+func (q *Queries) ArchiveOrders(ctx context.Context, limit int, readyWeeks []time.Time) (removed, archived int64, err error) {
 	err = q.db.QueryRow(ctx, `
 		WITH batch AS (`+archiveCandidates+`
+            AND (o.delete_after <= clock_timestamp() OR date_trunc('week', o.delete_after, 'UTC') = ANY($2::timestamptz[]))
+            `+oldestArchiveCandidates+`
 			FOR UPDATE OF o SKIP LOCKED
 		), removed_orders AS (
 			DELETE FROM orders o USING batch WHERE o.order_id = batch.order_id
@@ -95,7 +137,7 @@ func (q *Queries) ArchiveOrders(ctx context.Context, limit int) (removed, archiv
 			WHERE r.delete_after > clock_timestamp()
 			RETURNING 1
 		)
-		SELECT (SELECT count(*) FROM removed_orders), (SELECT count(*) FROM archived)`, limit).
+		SELECT (SELECT count(*) FROM removed_orders), (SELECT count(*) FROM archived)`, limit, readyWeeks).
 		Scan(&removed, &archived)
 	return removed, archived, err
 }
@@ -136,7 +178,13 @@ func ParsePartitionName(name string) (time.Time, bool) {
 	if !ok {
 		return time.Time{}, false
 	}
-	week, err := time.Parse("20060102", rest)
+	date, suffix, hasSuffix := strings.Cut(rest, "_")
+	if hasSuffix {
+		if _, err := uuid.Parse(suffix); err != nil || len(suffix) != 36 {
+			return time.Time{}, false
+		}
+	}
+	week, err := time.Parse("20060102", date)
 	return week, err == nil && week.Equal(WeekStart(week))
 }
 
@@ -144,12 +192,15 @@ func ParsePartitionName(name string) (time.Time, bool) {
 type Partition struct {
 	Name          string
 	DetachPending bool
+	Scheduled     bool
 }
 
 // ListPartitions returns the attached partitions of orders_history.
 func (q *Queries) ListPartitions(ctx context.Context) ([]Partition, error) {
 	rows, err := q.db.Query(ctx, `
-		SELECT c.relname, i.inhdetachpending FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+		SELECT c.relname, i.inhdetachpending, EXISTS (
+			SELECT 1 FROM history_partition_cleanup j WHERE j.partition_oid = c.oid)
+		FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
 		WHERE i.inhparent = 'orders_history'::regclass ORDER BY c.relname`)
 	if err != nil {
 		return nil, err
@@ -157,28 +208,95 @@ func (q *Queries) ListPartitions(ctx context.Context) ([]Partition, error) {
 	return pgx.CollectRows(rows, pgx.RowToStructByPos[Partition])
 }
 
-// ListDetachedPartitions returns tables named like history partitions that are no
-// longer attached, left behind by an interrupted cleanup.
-func (q *Queries) ListDetachedPartitions(ctx context.Context) ([]string, error) {
+// SchedulePartitionDrop records the identity while PostgreSQL still knows the parent.
+func (q *Queries) SchedulePartitionDrop(ctx context.Context, name string, week time.Time) error {
+	_, err := q.db.Exec(ctx, `
+		INSERT INTO history_partition_cleanup (partition_oid, partition_name, week_start)
+		SELECT c.oid, c.relname, $2 FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+		WHERE i.inhparent = 'orders_history'::regclass AND c.oid = to_regclass($1)
+		ON CONFLICT DO NOTHING`, name, week)
+	return err
+}
+
+type PartitionDrop struct {
+	OID      uint32
+	Name     string
+	Attached bool
+	Pending  bool
+}
+
+func (q *Queries) PendingPartitionDrops(ctx context.Context) ([]PartitionDrop, error) {
 	rows, err := q.db.Query(ctx, `
-		SELECT c.relname FROM pg_class c
-		WHERE c.relnamespace = (SELECT relnamespace FROM pg_class WHERE oid = 'orders_history'::regclass)
-			AND c.relkind = 'r' AND NOT c.relispartition AND starts_with(c.relname, $1)
-		ORDER BY c.relname`, partitionPrefix)
+		SELECT j.partition_oid, j.partition_name, i.inhrelid IS NOT NULL, coalesce(i.inhdetachpending, false)
+		FROM history_partition_cleanup j LEFT JOIN pg_inherits i
+			ON i.inhparent = 'orders_history'::regclass AND i.inhrelid = j.partition_oid
+			AND i.inhrelid = to_regclass(quote_ident(j.partition_name))
+		ORDER BY i.inhdetachpending DESC NULLS LAST, j.week_start`)
 	if err != nil {
 		return nil, err
 	}
-	return pgx.CollectRows(rows, pgx.RowTo[string])
+	return pgx.CollectRows(rows, pgx.RowToStructByPos[PartitionDrop])
+}
+
+// Creating partitions ahead must also skip a detached table still awaiting DROP.
+func (q *Queries) PartitionDropScheduled(ctx context.Context, week time.Time) (bool, error) {
+	var scheduled bool
+	err := q.db.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM history_partition_cleanup WHERE week_start = $1)`, week).Scan(&scheduled)
+	return scheduled, err
 }
 
 // CreatePartition creates the partition of the given week if it does not exist.
 func (q *Queries) CreatePartition(ctx context.Context, week time.Time) error {
 	week = WeekStart(week)
+	name := PartitionName(week)
+	var occupied bool
+	if err := q.db.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`, name).Scan(&occupied); err != nil {
+		return err
+	}
+	if occupied {
+		partitions, err := q.ListPartitions(ctx)
+		if err != nil {
+			return err
+		}
+		for _, p := range partitions {
+			if start, ok := ParsePartitionName(p.Name); ok && week.Equal(start) {
+				return nil
+			}
+		}
+		// An untracked table (including one detached before the journal was
+		// introduced) keeps its name and data. Use a fresh name for this week.
+		name += "_" + uuid.NewString()
+	}
 	_, err := q.db.Exec(ctx, fmt.Sprintf(
-		`CREATE TABLE IF NOT EXISTS %s PARTITION OF orders_history FOR VALUES FROM ('%s') TO ('%s')`,
-		pgx.Identifier{PartitionName(week)}.Sanitize(),
+		`CREATE TABLE %s PARTITION OF orders_history FOR VALUES FROM ('%s') TO ('%s')`,
+		pgx.Identifier{name}.Sanitize(),
 		week.Format(time.RFC3339), week.AddDate(0, 0, 7).Format(time.RFC3339)))
 	return err
+}
+
+// TryCreatePartition bounds the parent DDL lock wait. A reader or a pending
+// DETACH may hold it for an entire cycle; orders for ready weeks can still move.
+func (q *Queries) TryCreatePartition(ctx context.Context, week time.Time) (bool, error) {
+	err := pgx.BeginFunc(ctx, q.db, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, "SET LOCAL lock_timeout='50ms'"); err != nil {
+			return err
+		}
+		return (&Queries{db: tx}).CreatePartition(ctx, week)
+	})
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "55P03" {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+// LatestPartitionExpiry reads the last row's deadline using the retention index.
+// An empty partition returns ErrNotFound.
+func (q *Queries) LatestPartitionExpiry(ctx context.Context, name string) (time.Time, error) {
+	var latest time.Time
+	err := q.db.QueryRow(ctx, `SELECT delete_after FROM `+pgx.Identifier{name}.Sanitize()+
+		` ORDER BY delete_after DESC LIMIT 1`).Scan(&latest)
+	return latest, notFound(err)
 }
 
 // DetachPartition detaches a partition without blocking readers. It must run outside a transaction.
@@ -193,9 +311,48 @@ func (q *Queries) FinalizeDetach(ctx context.Context, name string) error {
 	return err
 }
 
-func (q *Queries) DropTable(ctx context.Context, name string) error {
-	_, err := q.db.Exec(ctx, `DROP TABLE IF EXISTS `+pgx.Identifier{name}.Sanitize())
-	return err
+// FinishPartitionDrop checks the identity again under the DDL lock. A replacement
+// table with the same name must survive, even if a previous cleanup was interrupted.
+func (q *Queries) FinishPartitionDrop(ctx context.Context, p PartitionDrop) (bool, error) {
+	var dropped bool
+	name := pgx.Identifier{p.Name}.Sanitize()
+	err := pgx.BeginFunc(ctx, q.db, func(tx pgx.Tx) error {
+		const matches = `SELECT EXISTS (SELECT 1 FROM pg_class
+			WHERE oid = $1 AND oid = to_regclass($2) AND NOT relispartition AND relkind = 'r')`
+		var same bool
+		if err := tx.QueryRow(ctx, matches, p.OID, name).Scan(&same); err != nil {
+			return err
+		}
+		if same {
+			if _, err := tx.Exec(ctx, "LOCK TABLE ONLY "+name+" IN ACCESS EXCLUSIVE MODE"); err != nil {
+				return err
+			}
+			if err := tx.QueryRow(ctx, matches, p.OID, name).Scan(&same); err != nil {
+				return err
+			}
+			if same {
+				if _, err := tx.Exec(ctx, "DROP TABLE "+name); err != nil {
+					return err
+				}
+				dropped = true
+			}
+		}
+		_, err := tx.Exec(ctx, `DELETE FROM history_partition_cleanup WHERE partition_oid=$1`, p.OID)
+		return err
+	})
+	return dropped, err
+}
+
+// WithLockTimeout lets a one-connection pool serve archive work between DDL retries.
+func (q *Queries) WithLockTimeout(ctx context.Context, timeout time.Duration, run func() error) error {
+	if _, err := q.db.Exec(ctx, `SELECT set_config('lock_timeout', $1, false)`, fmt.Sprintf("%dms", timeout.Milliseconds())); err != nil {
+		return err
+	}
+	err := run()
+	resetCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, resetErr := q.db.Exec(resetCtx, "RESET lock_timeout")
+	return errors.Join(err, resetErr)
 }
 
 // Stats is a snapshot of the database state for monitoring.

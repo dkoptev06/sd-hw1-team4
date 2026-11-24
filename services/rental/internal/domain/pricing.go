@@ -96,33 +96,48 @@ func IsLowCharge(charge int) bool {
 }
 
 // Price calculates offer terms by the ADR formulas.
-func Price(tariff Tariff, user UserProfile, scooter Scooter, coeffs Coefficients) Terms {
-	rate := floorMul(tariff.PricePerMinute, coeffs.Surge)
+func Price(tariff Tariff, user UserProfile, scooter Scooter, coeffs Coefficients) (Terms, error) {
+	rate := floorMul(big.NewInt(tariff.PricePerMinute), coeffs.Surge)
 	if IsLowCharge(scooter.Charge) {
 		rate = floorMul(rate, coeffs.LowChargeDiscount)
 	}
-	terms := Terms{MinuteRate: rate, UnlockFee: tariff.PriceUnlock, Deposit: tariff.DefaultDeposit}
+	if !rate.IsInt64() {
+		return Terms{}, errors.New("minute rate exceeds the supported amount")
+	}
+	terms := Terms{MinuteRate: rate.Int64(), UnlockFee: tariff.PriceUnlock, Deposit: tariff.DefaultDeposit}
 	if user.HasSubscription {
 		terms.UnlockFee = 0
 	}
 	if user.Trusted {
 		terms.Deposit = 0
 	}
-	return terms
+	return terms, nil
 }
 
 // TripCost is zero for trips shorter than MinBillableDuration and otherwise
 // unlock_fee + floor(floor(seconds) × minute_rate / 60).
-func TripCost(terms Terms, elapsed time.Duration) int64 {
-	if elapsed < MinBillableDuration {
-		return 0
+func TripCost(terms Terms, startedAt, now time.Time) (*big.Int, error) {
+	// Compute whole seconds directly: the difference between database timestamps
+	// can exceed the range of time.Duration.
+	seconds := now.Unix() - startedAt.Unix()
+	if now.Nanosecond() < startedAt.Nanosecond() {
+		seconds--
 	}
-	seconds := int64(elapsed / time.Second)
-	return terms.UnlockFee + seconds*terms.MinuteRate/60
+	if seconds < int64(MinBillableDuration/time.Second) {
+		return new(big.Int), nil
+	}
+	if terms.MinuteRate < 0 || terms.UnlockFee < 0 {
+		return nil, errors.New("trip price terms must be non-negative")
+	}
+
+	cost := big.NewInt(seconds)
+	cost.Mul(cost, big.NewInt(terms.MinuteRate))
+	cost.Quo(cost, big.NewInt(int64(time.Minute/time.Second)))
+	return cost.Add(cost, big.NewInt(terms.UnlockFee)), nil
 }
 
-func floorMul(value int64, factor *big.Rat) int64 {
-	product := new(big.Rat).Mul(new(big.Rat).SetInt64(value), factor)
+func floorMul(value *big.Int, factor *big.Rat) *big.Int {
+	numerator := new(big.Int).Mul(value, factor.Num())
 	// Both operands are non-negative, so truncating division is the floor.
-	return new(big.Int).Quo(product.Num(), product.Denom()).Int64()
+	return numerator.Quo(numerator, factor.Denom())
 }

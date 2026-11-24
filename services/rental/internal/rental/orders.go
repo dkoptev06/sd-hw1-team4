@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/big"
 	"time"
 
 	"github.com/google/uuid"
@@ -36,13 +37,13 @@ type StartResult struct {
 // Start creates a STARTING order and its START task from an offer. A repeated
 // request for the same offer returns the existing order and its current status.
 func (s *OrderService) Start(ctx context.Context, offerID uuid.UUID) (StartResult, error) {
-	if result, err := s.replay(ctx, &s.store.Queries, offerID); !errors.Is(err, storage.ErrNotFound) {
+	if result, err := findStartReplay(ctx, &s.store.Queries, offerID); !errors.Is(err, storage.ErrNotFound) {
 		return result, err
 	}
 
 	offer, err := s.store.GetOffer(ctx, offerID)
 	if errors.Is(err, storage.ErrNotFound) {
-		return s.replayArchived(ctx, &s.store.Queries, offerID)
+		return s.replayOr(ctx, offerID, domain.Wrap(domain.ErrNotFound, "offer %s not found", offerID))
 	}
 	if err != nil {
 		return StartResult{}, err
@@ -74,18 +75,26 @@ func (s *OrderService) Start(ctx context.Context, offerID uuid.UUID) (StartResul
 }
 
 func (s *OrderService) startInTx(ctx context.Context, q *storage.Queries, offerID uuid.UUID, current domain.Scooter) (StartResult, error) {
-	offer, err := q.LockOffer(ctx, offerID)
-	if errors.Is(err, storage.ErrNotFound) {
-		// The order was archived together with its offer after the first lookup.
-		return s.replayArchived(ctx, q, offerID)
+	offer, lockErr := q.LockOffer(ctx, offerID)
+	if lockErr != nil && !errors.Is(lockErr, storage.ErrNotFound) {
+		return StartResult{}, lockErr
 	}
-	if err != nil {
-		return StartResult{}, err
-	}
-	// Under the offer lock a concurrent start has either committed or not started.
-	if result, err := s.replay(ctx, q, offerID); !errors.Is(err, storage.ErrNotFound) {
+	// The order could have been created or archived since the initial lookup.
+	if result, err := findStartReplay(ctx, q, offerID); !errors.Is(err, storage.ErrNotFound) {
 		return result, err
 	}
+	if lockErr != nil {
+		return StartResult{}, domain.Wrap(domain.ErrNotFound, "offer %s not found", offerID)
+	}
+
+	if err := q.LockScooterForStart(ctx, offer.Scooter.ID); err != nil {
+		return StartResult{}, err
+	}
+	occupying, previousDeadline, err := q.LockOccupyingOrder(ctx, offer.Scooter.ID)
+	if err != nil && !errors.Is(err, storage.ErrNotFound) {
+		return StartResult{}, err
+	}
+	occupied := err == nil
 
 	now, err := q.Now(ctx)
 	if err != nil {
@@ -94,8 +103,15 @@ func (s *OrderService) startInTx(ctx context.Context, q *storage.Queries, offerI
 	if err := offer.CheckStart(now, current); err != nil {
 		return StartResult{}, err
 	}
-	if err := s.releaseExpiredStart(ctx, q, offer.Scooter.ID, now); err != nil {
-		return StartResult{}, err
+	if occupied {
+		if previousDeadline == nil || !occupying.CanBeReplacedAt(now, *previousDeadline) {
+			return StartResult{}, domain.Wrap(domain.ErrScooterBusy, "scooter %q has order %s", offer.Scooter.ID, occupying.ID)
+		}
+		// The worker will close the previous START task and issue any VOID.
+		deleteAfter := s.configs.Current().Retention.DeleteAfter(now, occupying.ZoneID)
+		if err := q.MarkOrderStartFailed(ctx, occupying.ID, now, deleteAfter); err != nil {
+			return StartResult{}, err
+		}
 	}
 
 	if err := q.ConsumeOffer(ctx, offerID); err != nil {
@@ -118,40 +134,8 @@ func (s *OrderService) startInTx(ctx context.Context, q *storage.Queries, offerI
 	return StartResult{OrderID: order.ID, Status: order.Status}, nil
 }
 
-// releaseExpiredStart frees the scooter from a STARTING order past its deadline by
-// closing it as START_FAILED. Its START task is left for the worker, which completes
-// it and creates a VOID. Any other occupying order makes the scooter busy.
-func (s *OrderService) releaseExpiredStart(ctx context.Context, q *storage.Queries, scooterID string, now time.Time) error {
-	occupying, deadline, err := q.LockOccupyingOrder(ctx, scooterID)
-	if errors.Is(err, storage.ErrNotFound) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	if deadline == nil || !occupying.CanBeReplacedAt(now, *deadline) {
-		return domain.Wrap(domain.ErrScooterBusy, "scooter %q has order %s", scooterID, occupying.ID)
-	}
-	deleteAfter := s.configs.Current().Retention.DeleteAfter(now, occupying.ZoneID)
-	return q.MarkOrderStartFailed(ctx, occupying.ID, now, deleteAfter)
-}
-
-// replay answers a repeated start from the current order of an existing offer.
-func (s *OrderService) replay(ctx context.Context, q *storage.Queries, offerID uuid.UUID) (StartResult, error) {
+func findStartReplay(ctx context.Context, q *storage.Queries, offerID uuid.UUID) (StartResult, error) {
 	ref, err := q.FindOrderByOffer(ctx, offerID)
-	if err != nil {
-		return StartResult{}, err
-	}
-	return StartResult{OrderID: ref.ID, Status: ref.Status, Replayed: true}, nil
-}
-
-// replayArchived answers a repeated start whose offer is gone: its order, if any,
-// was archived. Otherwise the offer never existed or expired unused.
-func (s *OrderService) replayArchived(ctx context.Context, q *storage.Queries, offerID uuid.UUID) (StartResult, error) {
-	ref, err := q.FindArchivedOrderByOffer(ctx, offerID)
-	if errors.Is(err, storage.ErrNotFound) {
-		return StartResult{}, domain.Wrap(domain.ErrNotFound, "offer %s not found", offerID)
-	}
 	if err != nil {
 		return StartResult{}, err
 	}
@@ -160,7 +144,7 @@ func (s *OrderService) replayArchived(ctx context.Context, q *storage.Queries, o
 
 // replayOr answers a retry that raced with a successful start; otherwise it returns fallback.
 func (s *OrderService) replayOr(ctx context.Context, offerID uuid.UUID, fallback error) (StartResult, error) {
-	result, err := s.replay(ctx, &s.store.Queries, offerID)
+	result, err := findStartReplay(ctx, &s.store.Queries, offerID)
 	if errors.Is(err, storage.ErrNotFound) {
 		return StartResult{}, fallback
 	}
@@ -170,7 +154,7 @@ func (s *OrderService) replayOr(ctx context.Context, offerID uuid.UUID, fallback
 // OrderView is the answer to GET /orders/{id}.
 type OrderView struct {
 	Order    domain.Order
-	Cost     *int64
+	Cost     *big.Int
 	Archived bool
 }
 
@@ -183,7 +167,11 @@ func (s *OrderService) Get(ctx context.Context, orderID uuid.UUID) (OrderView, e
 	if err != nil {
 		return OrderView{}, err
 	}
-	return OrderView{Order: order, Cost: order.CostAt(now), Archived: archived}, nil
+	cost, err := order.CostAt(now)
+	if err != nil {
+		return OrderView{}, fmt.Errorf("calculate cost for order %s: %w", orderID, err)
+	}
+	return OrderView{Order: order, Cost: cost, Archived: archived}, nil
 }
 
 // Finish closes an ACTIVE trip, fixes its cost and enqueues SETTLE. A repeated
@@ -223,7 +211,10 @@ func (s *OrderService) finishInTx(ctx context.Context, q *storage.Queries, order
 	if err != nil {
 		return domain.Order{}, err
 	}
-	status, cost := domain.FinishOutcome(order.Terms, *order.StartedAt, now)
+	status, cost, err := domain.FinishOutcome(order.Terms, *order.StartedAt, now)
+	if err != nil {
+		return domain.Order{}, fmt.Errorf("finish order %s: %w", orderID, err)
+	}
 	deleteAfter := s.configs.Current().Retention.DeleteAfter(now, order.ZoneID)
 	if err := q.MarkOrderFinished(ctx, orderID, status, now, deleteAfter, cost); err != nil {
 		return domain.Order{}, err
@@ -232,7 +223,7 @@ func (s *OrderService) finishInTx(ctx context.Context, q *storage.Queries, order
 	if err := q.InsertTask(ctx, orderID, domain.TaskSettle, settle, now, nil); err != nil {
 		return domain.Order{}, err
 	}
-	order.Status, order.Cost = status, &cost
+	order.Status, order.Cost = status, cost
 	order.FinishTime, order.ClosedAt, order.DeleteAfter = &now, &now, &deleteAfter
 	return order, nil
 }

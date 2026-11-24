@@ -2,6 +2,7 @@ package ledger
 
 import (
 	"errors"
+	"math/big"
 	"testing"
 	"time"
 )
@@ -12,7 +13,7 @@ func (c *clock) Now() time.Time { return c.now }
 
 func newLedger() (*Ledger, *clock) {
 	c := &clock{now: time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)}
-	return New(c.Now), c
+	return New(c.Now, false), c
 }
 
 func must(t *testing.T, got string, err error, want string) {
@@ -41,14 +42,14 @@ func TestHoldThenSettle(t *testing.T) {
 
 	r, err = l.Hold("op", "u", 301, expires)
 	fails(t, r, err, ErrParameterConflict)
-	r, err = l.Settle("op", "other", 100)
+	r, err = l.Settle("op", "other", big.NewInt(100))
 	fails(t, r, err, ErrUserMismatch)
 
-	r, err = l.Settle("op", "u", 100)
+	r, err = l.Settle("op", "u", big.NewInt(100))
 	must(t, r, err, Success)
-	r, err = l.Settle("op", "u", 100)
+	r, err = l.Settle("op", "u", big.NewInt(100))
 	must(t, r, err, Success)
-	r, err = l.Settle("op", "u", 90)
+	r, err = l.Settle("op", "u", big.NewInt(90))
 	fails(t, r, err, ErrParameterConflict)
 	r, err = l.Void("op")
 	fails(t, r, err, ErrInvalidOrder)
@@ -64,7 +65,7 @@ func TestVoidForbidsLateHold(t *testing.T) {
 	must(t, r, err, Success)
 	r, err = l.Hold("op", "u", 300, c.now.Add(time.Hour))
 	must(t, r, err, Failed)
-	r, err = l.Settle("op", "u", 0)
+	r, err = l.Settle("op", "u", big.NewInt(0))
 	fails(t, r, err, ErrInvalidOrder)
 	r, err = l.Status("op")
 	must(t, r, err, StatusVoided)
@@ -82,7 +83,7 @@ func TestHoldExpiry(t *testing.T) {
 	c.now = c.now.Add(time.Minute)
 	r, err = l.Status("op")
 	must(t, r, err, StatusHoldExpired)
-	r, err = l.Settle("op", "u", 50) // settling without a live hold is allowed
+	r, err = l.Settle("op", "u", big.NewInt(50)) // settling without a live hold is allowed
 	must(t, r, err, Success)
 }
 
@@ -90,10 +91,24 @@ func TestValidationAndUnknown(t *testing.T) {
 	l, c := newLedger()
 	r, err := l.Hold("op", "u", 0, c.now.Add(time.Hour))
 	fails(t, r, err, ErrInvalid)
-	r, err = l.Settle("op", "", 10)
+	r, err = l.Settle("op", "", big.NewInt(10))
 	fails(t, r, err, ErrInvalid)
 	r, err = l.Status("missing")
 	fails(t, r, err, ErrNotFound)
-	r, err = l.Settle("no-hold", "u", 0)
+	r, err = l.Settle("no-hold", "u", big.NewInt(0))
 	must(t, r, err, Success)
+}
+
+func TestSettleStoresCopyOfAmount(t *testing.T) {
+	l, _ := newLedger()
+	original := new(big.Int).Lsh(big.NewInt(1), 80)
+	request := new(big.Int).Set(original)
+	result, err := l.Settle("op", "u", request)
+	must(t, result, err, Success)
+
+	request.Add(request, big.NewInt(1))
+	result, err = l.Settle("op", "u", original)
+	must(t, result, err, Success)
+	result, err = l.Settle("op", "u", request)
+	fails(t, result, err, ErrParameterConflict)
 }

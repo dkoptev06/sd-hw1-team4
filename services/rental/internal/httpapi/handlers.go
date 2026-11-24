@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
+	"math/big"
 	"net/http"
 	"time"
 
@@ -103,7 +104,7 @@ func (a *API) startOrder(c *echo.Context) error {
 type orderResponse struct {
 	OrderID    string     `json:"order_id"`
 	Status     string     `json:"status"`
-	Cost       *int64     `json:"cost"`
+	Cost       *big.Int   `json:"cost"`
 	StartedAt  *time.Time `json:"started_at"`
 	FinishTime *time.Time `json:"finish_time"`
 }
@@ -133,7 +134,7 @@ type finishOrderResponse struct {
 	OrderID    string     `json:"order_id"`
 	Status     string     `json:"status"`
 	FinishTime *time.Time `json:"finish_time"`
-	Cost       *int64     `json:"cost"`
+	Cost       *big.Int   `json:"cost"`
 }
 
 func (a *API) finishOrder(c *echo.Context) error {

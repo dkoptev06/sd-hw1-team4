@@ -32,13 +32,14 @@ func TestClientClassification(t *testing.T) {
 		{"not found", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNotFound) }, ErrNotFound},
 		{"5xx", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusBadGateway) }, ErrUnavailable},
 		{"timeout", func(w http.ResponseWriter, r *http.Request) { time.Sleep(300 * time.Millisecond) }, ErrUnavailable},
-		{"broken body", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{`)) }, ErrUnavailable},
+		{"bad request", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusBadRequest) }, ErrInvalidResponse},
+		{"broken body", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{`)) }, ErrInvalidResponse},
 		{"contract violation", func(w http.ResponseWriter, r *http.Request) {
 			_, _ = w.Write([]byte(`{"id":"s-1","zone_id":"zone-1","charge":101}`))
-		}, ErrUnavailable},
+		}, ErrInvalidResponse},
 		{"missing charge", func(w http.ResponseWriter, r *http.Request) {
 			_, _ = w.Write([]byte(`{"id":"s-1","zone_id":"zone-1"}`))
-		}, ErrUnavailable},
+		}, ErrInvalidResponse},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -65,7 +66,7 @@ func TestClientPaths(t *testing.T) {
 		case "/user-profile/u-1":
 			_, _ = w.Write([]byte(`{"id":"u-1","has_subscription":true,"trusted":false}`))
 		case "/configs":
-			_, _ = w.Write([]byte(`{"price_coeff_settings":{"surge":1.25,"low_charge_discount":0.8},"default_retention_days":365}`))
+			_, _ = w.Write([]byte(`{"price_coeff_settings":{"surge":1.25,"low_charge_discount":0.8},"default_retention_days":365,"retention_days_by_zone":{}}`))
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -179,5 +180,59 @@ func TestTariffCacheLeaderCancelled(t *testing.T) {
 	close(release)
 	if err := <-followerResult; err != nil {
 		t.Fatalf("follower: %v", err)
+	}
+}
+
+// A second caller refreshes the zone while the first caller is checking the old entry.
+func TestTariffCacheRefreshBetweenLookupAndFetch(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	looking := make(chan struct{})
+	release := make(chan struct{})
+	var pauseFirst atomic.Bool
+	pauseFirst.Store(true)
+	ttl := func() time.Duration {
+		if pauseFirst.CompareAndSwap(true, false) {
+			close(looking)
+			select {
+			case <-release:
+			case <-ctx.Done():
+			}
+		}
+		return time.Minute
+	}
+	fresh := domain.Tariff{ZoneID: "zone", PricePerMinute: 20}
+	var calls atomic.Int32
+	fetch := func(context.Context, string) (domain.Tariff, error) {
+		if calls.Add(1) > 1 {
+			return domain.Tariff{}, ErrUnavailable
+		}
+		return fresh, nil
+	}
+	cache, err := NewTariffCache(1, fetch, ttl, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache.cache.Add(fresh.ZoneID, cachedTariff{tariff: domain.Tariff{ZoneID: fresh.ZoneID, PricePerMinute: 10}, fetchedAt: time.Now().Add(-time.Hour)})
+	first := make(chan error, 1)
+	go func() {
+		got, err := cache.Tariff(ctx, fresh.ZoneID)
+		if err == nil && got != fresh {
+			err = errors.New("first caller received the old tariff")
+		}
+		first <- err
+	}()
+	select {
+	case <-looking:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	got, err := cache.Tariff(ctx, fresh.ZoneID)
+	close(release)
+	if err != nil || got != fresh {
+		t.Fatalf("refresh: %+v, %v", got, err)
+	}
+	if err := <-first; err != nil || calls.Load() != 1 {
+		t.Fatalf("first caller: %v, Source calls: %d", err, calls.Load())
 	}
 }

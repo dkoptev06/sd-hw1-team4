@@ -47,6 +47,10 @@ type Worker struct {
 }
 
 func New(store *storage.Store, payments Payments, configs Configs, cfg settings.Worker, log *slog.Logger) *Worker {
+	// Export a zero sample so Prometheus can detect the first DLQ transition.
+	for _, kind := range []domain.TaskKind{domain.TaskSettle, domain.TaskVoid} {
+		metrics.TasksFinished.WithLabelValues(string(kind), string(domain.TaskDeadLetter), "")
+	}
 	return &Worker{
 		store: store, payments: payments, configs: configs, cfg: cfg,
 		maxAttempts: storage.MaxAttempts(cfg.MaxAttempts), log: log, jitter: rand.Float64,
@@ -117,12 +121,24 @@ func (w *Worker) acquireSlots(ctx context.Context, slots chan struct{}) int {
 func (w *Worker) execute(ctx context.Context, task storage.ClaimedTask) {
 	kind := string(task.Kind)
 	metrics.TaskClaimLag.WithLabelValues(kind).Observe(task.Lag.Seconds())
+	var start *startAttempt
+	var err error
+	if task.Kind == domain.TaskStart {
+		start, err = w.prepareStart(ctx, task.Task)
+		if err != nil {
+			w.log.Error("check START claim before HOLD", "task_id", task.ID, "order_id", task.OrderID, "error", err)
+			return
+		}
+		if start == nil {
+			return
+		}
+	}
+
 	started := time.Now()
-	result := w.call(ctx, task.Task)
+	result := w.call(ctx, task.Task, start)
 	metrics.TaskAttemptDuration.WithLabelValues(kind).Observe(time.Since(started).Seconds())
 	metrics.TaskAttempts.WithLabelValues(kind, result.Outcome.String()).Inc()
 
-	var err error
 	if task.Kind == domain.TaskStart {
 		err = w.applyStart(ctx, task.Task, result)
 	} else {
@@ -134,21 +150,61 @@ func (w *Worker) execute(ctx context.Context, task storage.ClaimedTask) {
 	}
 }
 
+type startAttempt struct {
+	hold   domain.HoldParams
+	detail string
+}
+
+// prepareStart rechecks START after dispatch and reads the deposit from the locked order.
+// The transaction ends before calling Payment.
+func (w *Worker) prepareStart(ctx context.Context, claimed domain.Task) (*startAttempt, error) {
+	var start *startAttempt
+	err := w.store.InTx(ctx, func(q *storage.Queries) error {
+		start = nil
+		order, task, _, owned, err := lockOwnedStart(ctx, q, claimed)
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil
+		}
+		if err != nil || !owned {
+			return err
+		}
+
+		start = &startAttempt{}
+		if err := json.Unmarshal(task.Params, &start.hold); err != nil {
+			start.detail = "invalid task parameters: " + err.Error()
+			return nil
+		}
+		storedAmount := start.hold.Amount
+		start.hold.Amount = order.Terms.Deposit
+		if storedAmount == start.hold.Amount {
+			return nil
+		}
+		// Earlier claims may have sent a different amount for this operation_id.
+		if task.AttemptCount > 1 {
+			start.detail = fmt.Sprintf("HOLD amount %d differs from order deposit %d after a prior attempt; reconcile in Payment before retrying",
+				storedAmount, start.hold.Amount)
+			return nil
+		}
+		// Persist the correction before the first Payment call so retries reuse it.
+		return q.UpdateStartHoldParams(ctx, task.ID, start.hold)
+	})
+	return start, err
+}
+
 // call performs the Payment command of an attempt. START without a deposit needs no HOLD.
-func (w *Worker) call(ctx context.Context, task domain.Task) payment.Result {
+func (w *Worker) call(ctx context.Context, task domain.Task, start *startAttempt) payment.Result {
 	invalid := func(err error) payment.Result {
 		return payment.Result{Outcome: payment.ContractError, Detail: "invalid task parameters: " + err.Error()}
 	}
 	switch task.Kind {
 	case domain.TaskStart:
-		var p domain.HoldParams
-		if err := json.Unmarshal(task.Params, &p); err != nil {
-			return invalid(err)
+		if start.detail != "" {
+			return payment.Result{Outcome: payment.ContractError, Detail: start.detail}
 		}
-		if p.Amount == 0 {
+		if start.hold.Amount == 0 {
 			return payment.Result{Outcome: payment.Success}
 		}
-		return w.payments.Hold(ctx, p)
+		return w.payments.Hold(ctx, start.hold)
 	case domain.TaskSettle:
 		var p domain.SettleParams
 		if err := json.Unmarshal(task.Params, &p); err != nil {
@@ -172,20 +228,24 @@ func (w *Worker) applyStart(ctx context.Context, claimed domain.Task, result pay
 	var event *taskEvent
 	err := w.store.InTx(ctx, func(q *storage.Queries) error {
 		event = nil
-		order, task, now, owned, err := w.lockOwnedStart(ctx, q, claimed)
-		if err != nil || !owned {
+		order, task, now, owned, err := lockOwnedStart(ctx, q, claimed)
+		if err != nil && !errors.Is(err, storage.ErrNotFound) {
 			return err
+		}
+		if !owned {
+			metrics.StaleClaims.WithLabelValues(string(claimed.Kind)).Inc()
+			return nil
 		}
 		switch result.Outcome {
 		case payment.Success:
 			if err := q.MarkOrderActive(ctx, order.ID, now); err != nil {
 				return err
 			}
-			if err := q.CompleteTask(ctx, task.ID, now, domain.ResultSuccess, nil, ""); err != nil {
+			event, err = completeTask(ctx, q, task, now, domain.ResultSuccess, nil, "")
+			if err != nil {
 				return err
 			}
 			metrics.OrderActivation.Observe(now.Sub(order.CreatedAt).Seconds())
-			event = &taskEvent{task: task, status: domain.TaskCompleted, result: domain.ResultSuccess}
 		case payment.Rejected:
 			event, err = w.failStart(ctx, q, order, task, now, domain.ReasonPaymentRejected, false, "")
 		case payment.ContractError:
@@ -203,7 +263,7 @@ func (w *Worker) applyStart(ctx context.Context, claimed domain.Task, result pay
 
 // lockOwnedStart locks the order and then the START task and checks that the claim
 // still owns the attempt and the order still waits for it.
-func (w *Worker) lockOwnedStart(ctx context.Context, q *storage.Queries, claimed domain.Task) (domain.Order, domain.Task, time.Time, bool, error) {
+func lockOwnedStart(ctx context.Context, q *storage.Queries, claimed domain.Task) (domain.Order, domain.Task, time.Time, bool, error) {
 	order, err := q.LockOrder(ctx, claimed.OrderID)
 	if err != nil {
 		return domain.Order{}, domain.Task{}, time.Time{}, false, err
@@ -216,11 +276,8 @@ func (w *Worker) lockOwnedStart(ctx context.Context, q *storage.Queries, claimed
 	if err != nil {
 		return domain.Order{}, domain.Task{}, time.Time{}, false, err
 	}
-	if !task.Owns(*claimed.ClaimID, now) || order.Status != domain.OrderStarting {
-		metrics.StaleClaims.WithLabelValues(string(claimed.Kind)).Inc()
-		return order, task, now, false, nil
-	}
-	return order, task, now, true, nil
+	owned := claimed.ClaimID != nil && task.Owns(*claimed.ClaimID, now) && order.Status == domain.OrderStarting
+	return order, task, now, owned, nil
 }
 
 // applyPayment records a SETTLE or VOID attempt.
@@ -242,12 +299,10 @@ func (w *Worker) applyPayment(ctx context.Context, claimed domain.Task, result p
 		}
 		switch {
 		case result.Outcome == payment.Success:
-			event = &taskEvent{task: task, status: domain.TaskCompleted, result: domain.ResultSuccess}
-			return q.CompleteTask(ctx, task.ID, now, domain.ResultSuccess, nil, "")
+			event, err = completeTask(ctx, q, task, now, domain.ResultSuccess, nil, "")
 		case result.Outcome == payment.Rejected && task.Kind == domain.TaskSettle:
 			// The payment cycle ended with a debt in Payment.
-			event = &taskEvent{task: task, status: domain.TaskCompleted, result: domain.ResultFailed}
-			return q.CompleteTask(ctx, task.ID, now, domain.ResultFailed, nil, "")
+			event, err = completeTask(ctx, q, task, now, domain.ResultFailed, nil, "")
 		case result.Outcome == payment.Transient:
 			return w.reschedule(ctx, q, task, now, result.Detail)
 		default:
@@ -256,9 +311,11 @@ func (w *Worker) applyPayment(ctx context.Context, claimed domain.Task, result p
 			if detail == "" {
 				detail = "unexpected result " + result.Outcome.String()
 			}
-			event = &taskEvent{task: task, status: domain.TaskDeadLetter, lastError: detail}
-			return q.DeadLetterTask(ctx, task.ID, detail)
+			var lastError string
+			lastError, err = q.DeadLetterTask(ctx, task.ID, detail)
+			event = &taskEvent{task: task, status: domain.TaskDeadLetter, lastError: lastError}
 		}
+		return err
 	})
 	if err == nil {
 		w.report(event)
@@ -282,10 +339,20 @@ func (w *Worker) failStart(ctx context.Context, q *storage.Queries, order domain
 			return nil, err
 		}
 	}
-	if err := q.CompleteTask(ctx, task.ID, now, domain.ResultFailed, &reason, lastError); err != nil {
+	return completeTask(ctx, q, task, now, domain.ResultFailed, &reason, lastError)
+}
+
+func completeTask(ctx context.Context, q *storage.Queries, task domain.Task, now time.Time,
+	result string, reason *domain.Reason, detail string) (*taskEvent, error) {
+	lastError, err := q.CompleteTask(ctx, task.ID, now, result, reason, detail)
+	if err != nil {
 		return nil, err
 	}
-	return &taskEvent{task: task, status: domain.TaskCompleted, result: domain.ResultFailed, reason: reason, lastError: lastError}, nil
+	event := &taskEvent{task: task, status: domain.TaskCompleted, result: result, lastError: lastError}
+	if reason != nil {
+		event.reason = *reason
+	}
+	return event, nil
 }
 
 // reschedule releases the claim after a transient failure. A START retry is never

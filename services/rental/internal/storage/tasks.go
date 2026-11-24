@@ -108,13 +108,22 @@ func (q *Queries) LockStartTask(ctx context.Context, orderID uuid.UUID) (domain.
 		`SELECT `+taskColumns+` FROM tasks WHERE order_id = $1 AND task_type = 'START' FOR UPDATE`, orderID))
 }
 
-// CompleteTask finalizes a task and releases its claim. An empty lastError keeps the previous one.
-func (q *Queries) CompleteTask(ctx context.Context, id uuid.UUID, finishedAt time.Time, result string, reason *domain.Reason, lastError string) error {
-	_, err := q.db.Exec(ctx, `
+// UpdateStartHoldParams corrects the HOLD amount under the first START claim's lock.
+func (q *Queries) UpdateStartHoldParams(ctx context.Context, id uuid.UUID, params domain.HoldParams) error {
+	_, err := q.db.Exec(ctx, `UPDATE tasks SET parameters = $2 WHERE task_id = $1`, id, params)
+	return err
+}
+
+// CompleteTask finalizes a task, releases its claim and returns the persisted last error.
+// An empty lastError keeps the previous one.
+func (q *Queries) CompleteTask(ctx context.Context, id uuid.UUID, finishedAt time.Time, result string, reason *domain.Reason, lastError string) (string, error) {
+	var persistedError string
+	err := q.db.QueryRow(ctx, `
 		UPDATE tasks SET status = 'COMPLETED', finished_at = $2, result = $3, completion_reason = $4,
 			last_error = COALESCE(NULLIF($5, ''), last_error), claim_id = NULL, lease_until = NULL
-		WHERE task_id = $1`, id, finishedAt, result, reason, lastError)
-	return err
+		WHERE task_id = $1
+		RETURNING COALESCE(last_error, '')`, id, finishedAt, result, reason, lastError).Scan(&persistedError)
+	return persistedError, err
 }
 
 // RescheduleTask records a transient failure and releases the claim until nextRunAt.
@@ -125,46 +134,52 @@ func (q *Queries) RescheduleTask(ctx context.Context, id uuid.UUID, nextRunAt ti
 	return err
 }
 
-// DeadLetterTask stops automatic attempts until a manual requeue.
-func (q *Queries) DeadLetterTask(ctx context.Context, id uuid.UUID, lastError string) error {
-	_, err := q.db.Exec(ctx, `
+// DeadLetterTask stops automatic attempts and returns the persisted last error.
+func (q *Queries) DeadLetterTask(ctx context.Context, id uuid.UUID, lastError string) (string, error) {
+	var persistedError string
+	err := q.db.QueryRow(ctx, `
 		UPDATE tasks SET status = 'DEAD_LETTER', last_error = COALESCE(NULLIF($2, ''), last_error),
 			claim_id = NULL, lease_until = NULL
-		WHERE task_id = $1`, id, lastError)
-	return err
+		WHERE task_id = $1
+		RETURNING COALESCE(last_error, '')`, id, lastError).Scan(&persistedError)
+	return persistedError, err
 }
 
-// FindStartsPastDeadline returns orders whose pending START reached its deadline.
-func (q *Queries) FindStartsPastDeadline(ctx context.Context, limit int) ([]uuid.UUID, error) {
+// SweepTask identifies a sweep candidate and its position in the ordered scan.
+// A nil Position starts a new scan before the first candidate.
+type SweepTask struct {
+	ID       uuid.UUID
+	OrderID  uuid.UUID
+	Kind     domain.TaskKind
+	Position *time.Time
+}
+
+// FindStartsPastDeadline returns the next page of START tasks ordered by deadline and ID.
+func (q *Queries) FindStartsPastDeadline(ctx context.Context, limit int, cutoff time.Time, after SweepTask) ([]SweepTask, error) {
 	rows, err := q.db.Query(ctx, `
-		SELECT order_id FROM tasks
-		WHERE task_type = 'START' AND status = 'PENDING' AND deadline_at <= clock_timestamp()
-		ORDER BY deadline_at, task_id LIMIT $1`, limit)
+		SELECT task_id, order_id, task_type, deadline_at FROM tasks
+		WHERE task_type = 'START' AND status = 'PENDING' AND deadline_at <= $4
+			AND (deadline_at, task_id) > (COALESCE($2::timestamptz, '-infinity'), $3::uuid)
+		ORDER BY deadline_at, task_id LIMIT $1`, limit, after.Position, after.ID, cutoff)
 	if err != nil {
 		return nil, err
 	}
-	return pgx.CollectRows(rows, pgx.RowTo[uuid.UUID])
+	return pgx.CollectRows(rows, pgx.RowToStructByPos[SweepTask])
 }
 
-// TaskRef identifies a task.
-type TaskRef struct {
-	ID      uuid.UUID
-	OrderID uuid.UUID
-	Kind    domain.TaskKind
-}
-
-// FindExhaustedTasks returns pending tasks with no attempts left and no live lease.
-func (q *Queries) FindExhaustedTasks(ctx context.Context, limit int, maxAttempts MaxAttempts) ([]TaskRef, error) {
+// FindExhaustedTasks returns the next page of tasks with no attempts left and no live lease.
+func (q *Queries) FindExhaustedTasks(ctx context.Context, limit int, maxAttempts MaxAttempts, cutoff time.Time, after SweepTask) ([]SweepTask, error) {
 	start, settle, void := maxAttempts.args()
 	rows, err := q.db.Query(ctx, `
-		SELECT task_id, order_id, task_type FROM tasks
-		WHERE status = 'PENDING' AND attempt_count >= `+maxAttemptsSQL+`
-			AND (lease_until IS NULL OR lease_until <= clock_timestamp())
-		ORDER BY next_run_at, task_id LIMIT $1`, limit, start, settle, void)
+		SELECT task_id, order_id, task_type, next_run_at FROM tasks
+		WHERE status = 'PENDING' AND attempt_count >= `+maxAttemptsSQL+` AND created_at <= $7
+			AND (lease_until IS NULL OR lease_until <= $7)
+			AND (next_run_at, task_id) > (COALESCE($5::timestamptz, '-infinity'), $6::uuid)
+		ORDER BY next_run_at, task_id LIMIT $1`, limit, start, settle, void, after.Position, after.ID, cutoff)
 	if err != nil {
 		return nil, err
 	}
-	return pgx.CollectRows(rows, pgx.RowToStructByPos[TaskRef])
+	return pgx.CollectRows(rows, pgx.RowToStructByPos[SweepTask])
 }
 
 // DeadLetter is a task waiting for manual recovery.

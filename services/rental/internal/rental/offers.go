@@ -18,7 +18,7 @@ import (
 	"github.com/dkoptev06/sd-hw1-team4/services/rental/internal/storage"
 )
 
-// Scooters reads fresh scooter data. Errors wrap source.ErrNotFound or source.ErrUnavailable.
+// Scooters reads fresh scooter data from Source.
 type Scooters interface {
 	Scooter(ctx context.Context, id string) (domain.Scooter, error)
 }
@@ -28,7 +28,7 @@ type Tariffs interface {
 	Tariff(ctx context.Context, zoneID string) (domain.Tariff, error)
 }
 
-// Profiles reads user profiles. Errors wrap source.ErrNotFound or source.ErrUnavailable.
+// Profiles reads user profiles. Only source.ErrUnavailable allows fallback pricing.
 type Profiles interface {
 	UserProfile(ctx context.Context, id string) (domain.UserProfile, error)
 }
@@ -88,12 +88,16 @@ func (s *OfferService) Create(ctx context.Context, req CreateOfferRequest) (offe
 	if err != nil {
 		return domain.Offer{}, false, err
 	}
+	terms, err := domain.Price(tariff, profile, scooter, s.configs.Current().Coefficients)
+	if err != nil {
+		return domain.Offer{}, false, domain.Wrap(domain.ErrSourceUnavailable, "price for zone %q: %v", scooter.ZoneID, err)
+	}
 	offer = domain.Offer{
 		ID:              uuid.New(),
 		IdempotencyID:   req.IdempotencyID,
 		UserID:          req.UserID,
 		Scooter:         scooter,
-		Terms:           domain.Price(tariff, profile, scooter, s.configs.Current().Coefficients),
+		Terms:           terms,
 		ProfileFallback: profile.Fallback,
 	}
 	stored, inserted, err := s.store.InsertOffer(ctx, offer, s.ttl)

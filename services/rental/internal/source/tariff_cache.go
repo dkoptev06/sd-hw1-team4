@@ -40,11 +40,15 @@ func NewTariffCache(size int, fetch TariffFetcher, ttl func() time.Duration, now
 	return &TariffCache{fetch: fetch, ttl: ttl, now: now, cache: cache}, nil
 }
 
+func (c *TariffCache) isFresh(entry cachedTariff) bool {
+	return c.now().Sub(entry.fetchedAt) < c.ttl()
+}
+
 // Tariff returns a fresh tariff or a domain error: ZONE_STALE when only an expired
 // entry is available, SOURCE_UNAVAILABLE when there is nothing cached.
 func (c *TariffCache) Tariff(ctx context.Context, zoneID string) (domain.Tariff, error) {
 	cached, found := c.cache.Get(zoneID)
-	if found && c.now().Sub(cached.fetchedAt) < c.ttl() {
+	if found && c.isFresh(cached) {
 		metrics.TariffCache.WithLabelValues("hit").Inc()
 		return cached.tariff, nil
 	}
@@ -54,6 +58,10 @@ func (c *TariffCache) Tariff(ctx context.Context, zoneID string) (domain.Tariff,
 	// Source client bounds the call with its own timeout.
 	fetchCtx := context.WithoutCancel(ctx)
 	results := c.group.DoChan(zoneID, func() (any, error) {
+		// A previous fetch may have completed since the caller looked in the cache.
+		if current, ok := c.cache.Get(zoneID); ok && c.isFresh(current) {
+			return current.tariff, nil
+		}
 		tariff, err := c.fetch(fetchCtx, zoneID)
 		if err != nil {
 			return nil, err

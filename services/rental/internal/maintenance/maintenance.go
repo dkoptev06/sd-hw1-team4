@@ -1,6 +1,6 @@
 // Package maintenance deletes completed tasks, archives closed orders into weekly
 // orders_history partitions, deletes expired offers and drops expired partitions.
-// Replicas coordinate through a lease in PostgreSQL; only the holder runs a cycle.
+// Replicas coordinate through a PostgreSQL lease and a session lock during each cycle.
 package maintenance
 
 import (
@@ -24,39 +24,55 @@ type Maintenance struct {
 	cfg    settings.Maintenance
 	holder uuid.UUID
 	log    *slog.Logger
-	now    func() time.Time
 }
 
 func New(store *storage.Store, cfg settings.Maintenance, log *slog.Logger) *Maintenance {
-	return &Maintenance{store: store, cfg: cfg, holder: uuid.New(), log: log, now: time.Now}
+	return &Maintenance{store: store, cfg: cfg, holder: uuid.New(), log: log}
 }
 
 // Run executes a cycle every interval while holding the lease, until ctx is done.
 func (m *Maintenance) Run(ctx context.Context) error {
 	go m.statsLoop(ctx)
+	// Long-running partition DDL uses a separate session. Coalesce requests
+	// while old readers hold a DETACH open and keep draining the order queue.
+	requests := make(chan struct{}, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range requests {
+			if err := m.cleanPartitions(ctx); err != nil && ctx.Err() == nil {
+				m.log.Error("partition cleanup", "error", err)
+			}
+		}
+	}()
+	defer func() {
+		close(requests)
+		<-done
+		m.release()
+	}()
 	ticker := time.NewTicker(m.cfg.Interval)
 	defer ticker.Stop()
 	for {
-		held, err := m.renewLease(ctx)
-		switch {
-		case err != nil && ctx.Err() == nil:
-			m.log.Error("acquire maintenance lease", "error", err)
-		case held:
-			if err := m.RunCycle(ctx); err != nil && ctx.Err() == nil {
-				m.log.Error("maintenance cycle", "error", err)
+		held, err := m.archiveCycle(ctx)
+		if err != nil && ctx.Err() == nil {
+			m.log.Error("maintenance cycle", "error", err)
+		}
+		if held {
+			select {
+			case requests <- struct{}{}:
+			default:
 			}
 		}
 		select {
 		case <-ctx.Done():
-			m.release()
 			return nil
 		case <-ticker.C:
 		}
 	}
 }
 
-func (m *Maintenance) renewLease(ctx context.Context) (bool, error) {
-	held, err := m.store.AcquireLease(ctx, leaseName, m.holder, m.cfg.Lease)
+func (m *Maintenance) renewLease(ctx context.Context, q *storage.Queries) (bool, error) {
+	held, err := q.AcquireLease(ctx, leaseName, m.holder, m.cfg.Lease)
 	if held {
 		metrics.MaintenanceLeaseHeld.Set(1)
 	} else {
@@ -77,23 +93,47 @@ func (m *Maintenance) release() {
 // errLeaseLost stops a cycle when another replica took the lease.
 var errLeaseLost = errors.New("maintenance lease lost")
 
-// RunCycle runs all steps once. Each step works in batches until it runs out of work.
-// The order matters: tasks are deleted before orders are archived, because an order
-// is archived only when it has no tasks.
+// RunCycle runs one maintenance cycle when no other session is running it and the
+// lease is available to this replica.
 func (m *Maintenance) RunCycle(ctx context.Context) error {
+	held, err := m.archiveCycle(ctx)
+	if !held {
+		return err
+	}
+	return errors.Join(err, m.cleanPartitions(ctx))
+}
+
+func (m *Maintenance) archiveCycle(ctx context.Context) (bool, error) {
+	var held bool
+	locked, err := m.store.WithMaintenanceLock(ctx, leaseName, func(q *storage.Queries) error {
+		var err error
+		held, err = m.renewLease(ctx, q)
+		if !held || err != nil {
+			return err
+		}
+		return m.runCycle(ctx, q)
+	})
+	if !locked {
+		metrics.MaintenanceLeaseHeld.Set(0)
+	}
+	return held, err
+}
+
+// runCycle deletes completed tasks before selecting task-free orders for archiving.
+func (m *Maintenance) runCycle(ctx context.Context, q *storage.Queries) error {
 	steps := []struct {
 		name string
-		run  func(context.Context) error
+		run  func(context.Context, *storage.Queries) error
 	}{
+		{"schedule_partitions", m.scheduleExpiredPartitions},
 		{"purge_tasks", m.purgeCompletedTasks},
 		{"ensure_partitions", m.ensureUpcomingPartitions},
 		{"archive_orders", m.archiveOrders},
 		{"purge_offers", m.purgeExpiredOffers},
-		{"drop_partitions", m.dropExpiredPartitions},
 	}
 	for _, step := range steps {
 		started := time.Now()
-		err := step.run(ctx)
+		err := step.run(ctx, q)
 		metrics.MaintenanceStepDuration.WithLabelValues(step.name).Observe(time.Since(started).Seconds())
 		if err != nil {
 			return fmt.Errorf("%s: %w", step.name, err)
@@ -103,7 +143,7 @@ func (m *Maintenance) RunCycle(ctx context.Context) error {
 }
 
 // batches calls fn until it processes less than a full batch, renewing the lease in between.
-func (m *Maintenance) batches(ctx context.Context, step string, fn func() (int64, error)) error {
+func (m *Maintenance) batches(ctx context.Context, q *storage.Queries, step string, fn func() (int64, error)) error {
 	for {
 		n, err := fn()
 		if err != nil {
@@ -113,7 +153,7 @@ func (m *Maintenance) batches(ctx context.Context, step string, fn func() (int64
 		if n < int64(m.cfg.BatchSize) {
 			return nil
 		}
-		held, err := m.renewLease(ctx)
+		held, err := m.renewLease(ctx, q)
 		if err != nil {
 			return err
 		}
@@ -123,16 +163,16 @@ func (m *Maintenance) batches(ctx context.Context, step string, fn func() (int64
 	}
 }
 
-func (m *Maintenance) purgeCompletedTasks(ctx context.Context) error {
-	return m.batches(ctx, "purge_tasks", func() (int64, error) {
-		return m.store.PurgeCompletedTasks(ctx, m.cfg.BatchSize)
+func (m *Maintenance) purgeCompletedTasks(ctx context.Context, q *storage.Queries) error {
+	return m.batches(ctx, q, "purge_tasks", func() (int64, error) {
+		return q.PurgeCompletedTasks(ctx, m.cfg.BatchSize)
 	})
 }
 
-func (m *Maintenance) archiveOrders(ctx context.Context) error {
+func (m *Maintenance) archiveOrders(ctx context.Context, q *storage.Queries) error {
 	var archived int64
-	err := m.batches(ctx, "archive_orders", func() (int64, error) {
-		removed, moved, err := m.archiveBatch(ctx)
+	err := m.batches(ctx, q, "archive_orders", func() (int64, error) {
+		removed, moved, err := m.archiveBatch(ctx, q)
 		archived += moved
 		return removed, err
 	})
@@ -143,25 +183,26 @@ func (m *Maintenance) archiveOrders(ctx context.Context) error {
 // archiveBatch creates the history partitions the next batch needs and archives it.
 // If the batch differs from the inspected candidates (rows locked or added in
 // between) and needs a missing partition, it inspects the candidates again.
-func (m *Maintenance) archiveBatch(ctx context.Context) (removed, archived int64, err error) {
+func (m *Maintenance) archiveBatch(ctx context.Context, q *storage.Queries) (removed, archived int64, err error) {
 	const maxAttempts = 4
 	for attempt := 1; ; attempt++ {
-		weeks, err := m.store.ArchiveCandidateWeeks(ctx, m.cfg.BatchSize)
+		weeks, err := q.ArchiveCandidateWeeks(ctx, m.cfg.BatchSize)
 		if err != nil {
 			return 0, 0, err
 		}
-		if err := m.ensurePartitions(ctx, weeks); err != nil {
+		readyWeeks, err := m.ensurePartitions(ctx, q, weeks)
+		if err != nil {
 			return 0, 0, err
 		}
-		removed, archived, err = m.store.ArchiveOrders(ctx, m.cfg.BatchSize)
+		removed, archived, err = q.ArchiveOrders(ctx, m.cfg.BatchSize, readyWeeks)
 		if !storage.IsMissingPartition(err) || attempt == maxAttempts {
 			return removed, archived, err
 		}
 	}
 }
 
-func (m *Maintenance) purgeExpiredOffers(ctx context.Context) error {
-	return m.batches(ctx, "purge_offers", func() (int64, error) {
-		return m.store.PurgeExpiredOffers(ctx, m.cfg.OfferGrace, m.cfg.BatchSize)
+func (m *Maintenance) purgeExpiredOffers(ctx context.Context, q *storage.Queries) error {
+	return m.batches(ctx, q, "purge_offers", func() (int64, error) {
+		return q.PurgeExpiredOffers(ctx, m.cfg.OfferGrace, m.cfg.BatchSize)
 	})
 }

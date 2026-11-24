@@ -35,10 +35,12 @@ func (q *Queries) FindOfferByIdempotencyID(ctx context.Context, key string) (dom
 // It returns inserted=false if another request already used the idempotency key.
 func (q *Queries) InsertOffer(ctx context.Context, o domain.Offer, ttl time.Duration) (domain.Offer, bool, error) {
 	row := q.db.QueryRow(ctx, `
+		WITH offer_time AS (SELECT clock_timestamp() AS created_at)
 		INSERT INTO offers (offer_id, idempotency_id, user_id, scooter_id, zone_id, charge, minute_rate,
 			unlock_fee, deposit, user_profile_fallback_used, status, created_at, expires_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'AVAILABLE', clock_timestamp(),
-			clock_timestamp() + make_interval(secs => $11))
+		SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'AVAILABLE', created_at,
+			created_at + make_interval(secs => $11)
+		FROM offer_time
 		ON CONFLICT (idempotency_id) DO NOTHING
 		RETURNING `+offerColumns,
 		o.ID, o.IdempotencyID, o.UserID, o.Scooter.ID, o.Scooter.ZoneID, o.Scooter.Charge,

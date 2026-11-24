@@ -2,6 +2,7 @@ package domain
 
 import (
 	"encoding/json"
+	"math/big"
 	"time"
 
 	"github.com/google/uuid"
@@ -49,9 +50,9 @@ type HoldParams struct {
 
 // SettleParams are the immutable parameters of a SETTLE task.
 type SettleParams struct {
-	OperationID string `json:"operation_id"`
-	UserID      string `json:"user_id"`
-	TotalAmount int64  `json:"total_amount"`
+	OperationID string   `json:"operation_id"`
+	UserID      string   `json:"user_id"`
+	TotalAmount *big.Int `json:"total_amount"`
 }
 
 // VoidParams are the immutable parameters of a VOID task.

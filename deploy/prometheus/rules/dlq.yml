@@ -1,0 +1,21 @@
+groups:
+  - name: rental-dlq
+    rules:
+      - alert: RentalTaskDeadLettered
+        expr: |
+          (
+            sum by (kind) (
+              increase(rental_tasks_finished_total{job="rental-worker", status="DEAD_LETTER"}[2m])
+            ) > 0
+          )
+          or
+          (
+            max by (kind) (
+              rental_tasks{job="rental-maintenance", status="DEAD_LETTER"}
+            ) > 0
+          )
+        labels:
+          severity: warning
+        annotations:
+          summary: "Задачи {{ $labels.kind }} попали в DLQ"
+          description: "Проверьте причину через rental dlq list и в журнале worker."

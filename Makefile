@@ -6,7 +6,7 @@ BUILD_DIR := $(CURDIR)/build
 GOFLAGS_COMMON := -buildvcs=false
 RENTAL_TEST_DATABASE_URL ?= postgres://rental:rental@127.0.0.1:$(or $(RENTAL_POSTGRES_PORT),55432)/rental?sslmode=disable
 
-.PHONY: check test test-integration vet build up down logs db-up
+.PHONY: check test test-integration test-functional vet build up down logs db-up
 
 check: test vet build
 
@@ -19,6 +19,9 @@ test:
 # Rental tests including PostgreSQL integration tests (start the database with `make db-up`).
 test-integration:
 	cd services/rental && RENTAL_TEST_DATABASE_URL='$(RENTAL_TEST_DATABASE_URL)' GOWORK=off go test $(GOFLAGS_COMMON) -race -count=1 ./...
+
+test-functional:
+	cd services/rental && RENTAL_TEST_DATABASE_URL='$(RENTAL_TEST_DATABASE_URL)' GOWORK=off go test $(GOFLAGS_COMMON) -race -count=1 -tags=functional -v ./tests/...
 
 vet:
 	set -e; for module in $(GO_MODULES); do \

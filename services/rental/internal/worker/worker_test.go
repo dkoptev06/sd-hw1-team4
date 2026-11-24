@@ -1,15 +1,19 @@
 package worker
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
+	"math/big"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/dkoptev06/sd-hw1-team4/services/rental/internal/domain"
 	"github.com/dkoptev06/sd-hw1-team4/services/rental/internal/dynconfig"
@@ -23,6 +27,7 @@ type fakePayments struct {
 	mu      sync.Mutex
 	results map[domain.TaskKind]payment.Result
 	calls   map[domain.TaskKind]int
+	holds   []domain.HoldParams
 	during  func() // runs inside the call, before the answer
 }
 
@@ -50,7 +55,10 @@ func (f *fakePayments) count(kind domain.TaskKind) int {
 	return f.calls[kind]
 }
 
-func (f *fakePayments) Hold(context.Context, domain.HoldParams) payment.Result {
+func (f *fakePayments) Hold(_ context.Context, params domain.HoldParams) payment.Result {
+	f.mu.Lock()
+	f.holds = append(f.holds, params)
+	f.mu.Unlock()
 	return f.answer(domain.TaskStart)
 }
 func (f *fakePayments) Settle(context.Context, domain.SettleParams) payment.Result {
@@ -185,6 +193,26 @@ func str(p *string) string {
 	return *p
 }
 
+func (e *env) captureLog() *bytes.Buffer {
+	var log bytes.Buffer
+	e.worker.log = slog.New(slog.NewJSONHandler(&log, nil))
+	return &log
+}
+
+func requireTaskLog(t *testing.T, log *bytes.Buffer, orderID uuid.UUID, kind domain.TaskKind, status, lastError string) {
+	t.Helper()
+	var event struct {
+		OrderID   string `json:"order_id"`
+		Kind      string `json:"kind"`
+		Status    string `json:"status"`
+		LastError string `json:"last_error"`
+	}
+	if err := json.Unmarshal(log.Bytes(), &event); err != nil || event.OrderID != orderID.String() ||
+		event.Kind != string(kind) || event.Status != status || event.LastError != lastError {
+		t.Fatalf("%s log for %s should contain %q: %s (%v)", status, orderID, lastError, log, err)
+	}
+}
+
 func TestStartOutcomes(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -224,6 +252,7 @@ func TestStartOutcomes(t *testing.T) {
 
 func TestTransientFailureIsRetried(t *testing.T) {
 	e := newEnv(t)
+	log := e.captureLog()
 	e.payments.set(domain.TaskStart, payment.Result{Outcome: payment.Transient, Detail: "status 503"})
 	order := e.startingOrder(t, 300)
 	e.runOnce(t)
@@ -240,6 +269,131 @@ func TestTransientFailureIsRetried(t *testing.T) {
 	e.runOnce(t)
 	if got := e.orderStatus(t, order.ID); got != domain.OrderActive {
 		t.Fatalf("order after retry %s", got)
+	}
+	if start, _ := e.task(t, order.ID, domain.TaskStart); start.Status != "COMPLETED" || str(start.Error) != "status 503" {
+		t.Fatalf("completed START %+v", start)
+	}
+	requireTaskLog(t, log, order.ID, domain.TaskStart, "COMPLETED", "status 503")
+}
+
+func TestStartUsesOrderDeposit(t *testing.T) {
+	t.Run("positive deposit corrects first HOLD and keeps it on retry", func(t *testing.T) {
+		e := newEnv(t)
+		order := e.startingOrder(t, 300)
+		testdb.Exec(t, e.store, `UPDATE tasks SET parameters = jsonb_set(parameters, '{amount}', '0') WHERE order_id = $1`, order.ID)
+		e.payments.set(domain.TaskStart, payment.Result{Outcome: payment.Transient, Detail: "timeout"})
+		e.payments.during = func() {
+			var amount int64
+			err := e.store.Pool().QueryRow(t.Context(),
+				`SELECT (parameters ->> 'amount')::bigint FROM tasks WHERE order_id = $1`, order.ID).Scan(&amount)
+			if err != nil || amount != 300 {
+				t.Fatalf("HOLD amount should be recorded before Payment runs, got %d (%v)", amount, err)
+			}
+		}
+		e.runOnce(t)
+		e.payments.during = nil
+
+		holds := e.payments.holds
+		if len(holds) != 1 || holds[0].Amount != 300 || holds[0].OperationID != order.ID.String() ||
+			holds[0].UserID != order.UserID || !holds[0].HoldExpiresAt.Equal(order.CreatedAt.Add(time.Hour+2*time.Minute)) {
+			t.Fatalf("first HOLD should keep its saved identifiers and expiration, with the order deposit: %+v", holds)
+		}
+
+		testdb.Exec(t, e.store, `UPDATE tasks SET next_run_at = clock_timestamp() WHERE order_id = $1`, order.ID)
+		e.payments.set(domain.TaskStart, payment.Result{Outcome: payment.Success})
+		e.runOnce(t)
+		holds = e.payments.holds
+		if len(holds) != 2 || holds[0] != holds[1] || e.orderStatus(t, order.ID) != domain.OrderActive {
+			t.Fatalf("retry should use the first HOLD parameters and activate the order: %+v", holds)
+		}
+	})
+
+	t.Run("zero deposit skips a first HOLD", func(t *testing.T) {
+		e := newEnv(t)
+		order := e.startingOrder(t, 0)
+		testdb.Exec(t, e.store, `UPDATE tasks SET parameters = jsonb_set(parameters, '{amount}', '300') WHERE order_id = $1`, order.ID)
+		e.runOnce(t)
+		if calls := e.payments.count(domain.TaskStart); calls != 0 || e.orderStatus(t, order.ID) != domain.OrderActive {
+			t.Fatalf("zero deposit should activate the order without HOLD, got %d calls", calls)
+		}
+	})
+
+	for _, test := range []struct {
+		name     string
+		deposit  int64
+		wantVoid bool
+	}{
+		{name: "positive deposit uses VOID", deposit: 300, wantVoid: true},
+		{name: "zero deposit records the need to reconcile"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			e := newEnv(t)
+			log := e.captureLog()
+			order := e.startingOrder(t, test.deposit)
+			testdb.Exec(t, e.store, `UPDATE tasks SET parameters = jsonb_set(parameters, '{amount}', '200'),
+				attempt_count = 1 WHERE order_id = $1`, order.ID)
+			e.runOnce(t)
+
+			start, _ := e.task(t, order.ID, domain.TaskStart)
+			_, hasVoid := e.task(t, order.ID, domain.TaskVoid)
+			if start.Status != "COMPLETED" || str(start.Reason) != "CONTRACT_ERROR" ||
+				!strings.Contains(str(start.Error), "reconcile in Payment") || hasVoid != test.wantVoid ||
+				e.orderStatus(t, order.ID) != domain.OrderStartFailed || e.payments.count(domain.TaskStart) != 0 {
+				t.Fatalf("incompatible HOLD retry must stop and be recorded: START %+v, VOID=%t", start, hasVoid)
+			}
+			requireTaskLog(t, log, order.ID, domain.TaskStart, "COMPLETED", str(start.Error))
+		})
+	}
+}
+
+func TestStartDeadlineLogsLastError(t *testing.T) {
+	e := newEnv(t)
+	log := e.captureLog()
+	e.payments.set(domain.TaskStart, payment.Result{Outcome: payment.Transient, Detail: "timeout"})
+	order := e.startingOrder(t, 300)
+	e.runOnce(t)
+	testdb.Exec(t, e.store, `UPDATE tasks SET deadline_at = clock_timestamp() WHERE order_id = $1`, order.ID)
+	if err := e.worker.FinalizeStart(t.Context(), order.ID); err != nil {
+		t.Fatal(err)
+	}
+	start, _ := e.task(t, order.ID, domain.TaskStart)
+	if start.Status != "COMPLETED" || str(start.Reason) != "DEADLINE_EXCEEDED" || str(start.Error) != "timeout" {
+		t.Fatalf("expired START %+v", start)
+	}
+	requireTaskLog(t, log, order.ID, domain.TaskStart, "COMPLETED", "timeout")
+}
+
+func TestStartSkipsHoldForInvalidClaim(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		beforeRun func(*testing.T, *env, uuid.UUID)
+	}{
+		{name: "deadline passed before call", beforeRun: func(t *testing.T, e *env, id uuid.UUID) {
+			testdb.Exec(t, e.store, `UPDATE tasks SET deadline_at = clock_timestamp() WHERE order_id = $1`, id)
+		}},
+		{name: "start already completed", beforeRun: func(t *testing.T, e *env, id uuid.UUID) {
+			testdb.Exec(t, e.store, `UPDATE tasks SET deadline_at = clock_timestamp() WHERE order_id = $1`, id)
+			if err := e.worker.FinalizeStart(t.Context(), id); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "another claim replaced this one", beforeRun: func(t *testing.T, e *env, id uuid.UUID) {
+			testdb.Exec(t, e.store, `UPDATE tasks SET claim_id = gen_random_uuid() WHERE order_id = $1`, id)
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			e := newEnv(t)
+			order := e.startingOrder(t, 300)
+			claimed := e.claim(t)
+			if len(claimed) != 1 {
+				t.Fatalf("START claims: %+v", claimed)
+			}
+			test.beforeRun(t, e, order.ID)
+			e.worker.execute(t.Context(), claimed[0])
+			if calls := e.payments.count(domain.TaskStart); calls != 0 {
+				t.Fatalf("sent %d HOLD calls with an invalid START claim", calls)
+			}
+		})
 	}
 }
 
@@ -351,6 +505,57 @@ func TestSweepDrainsBacklog(t *testing.T) {
 	}
 }
 
+func TestSweepContinuesAfterFailedTask(t *testing.T) {
+	e := newEnv(t)
+	e.worker.cfg.BatchSize = 1
+	first := e.startingOrder(t, 250)
+	second := e.startingOrder(t, 0)
+	testdb.Exec(t, e.store, `UPDATE tasks SET deadline_at = created_at;
+		ALTER TABLE tasks ADD CONSTRAINT injected_void_failure CHECK (task_type <> 'VOID')`)
+	if err := e.worker.Sweep(t.Context()); err == nil || !strings.Contains(err.Error(), "injected_void_failure") {
+		t.Fatalf("expected failure to insert the first order's VOID, got %v", err)
+	}
+	if e.orderStatus(t, first.ID) != domain.OrderStarting || e.orderStatus(t, second.ID) != domain.OrderStartFailed {
+		t.Fatal("the failed START must roll back while the next page still completes")
+	}
+}
+
+func TestSweepDefersNewWorkToNextPass(t *testing.T) {
+	e := newEnv(t)
+	e.worker.cfg.BatchSize = 1
+	first := e.startingOrder(t, 250)
+	second := e.startingOrder(t, 0)
+	testdb.Exec(t, e.store, `UPDATE tasks SET deadline_at = created_at WHERE order_id = $1`, first.ID)
+	// Closing the first START causes another deadline to pass and inserts an
+	// exhausted VOID with a future schedule while the sweep is between pages.
+	testdb.Exec(t, e.store, `
+		CREATE FUNCTION add_work_during_sweep() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN
+			UPDATE tasks SET deadline_at = clock_timestamp()
+			WHERE task_type = 'START' AND order_id <> NEW.order_id;
+			NEW.attempt_count := 3;
+			NEW.next_run_at := clock_timestamp() + interval '1 day';
+			RETURN NEW;
+		END;
+		$$;
+		CREATE TRIGGER add_work BEFORE INSERT ON tasks FOR EACH ROW
+			WHEN (NEW.task_type = 'VOID') EXECUTE FUNCTION add_work_during_sweep()`)
+	if err := e.worker.Sweep(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	void, _ := e.task(t, first.ID, domain.TaskVoid)
+	if void.Status != "PENDING" || e.orderStatus(t, second.ID) != domain.OrderStarting {
+		t.Fatalf("first pass picked up new work: VOID %+v, order %s", void, e.orderStatus(t, second.ID))
+	}
+	if err := e.worker.Sweep(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	void, _ = e.task(t, first.ID, domain.TaskVoid)
+	if void.Status != "DEAD_LETTER" || e.orderStatus(t, second.ID) != domain.OrderStartFailed {
+		t.Fatalf("second pass missed new work: VOID %+v, order %s", void, e.orderStatus(t, second.ID))
+	}
+}
+
 func TestStartClosedByAPI(t *testing.T) {
 	e := newEnv(t)
 	order := e.startingOrder(t, 300)
@@ -380,12 +585,79 @@ func (e *env) settleTask(t *testing.T) uuid.UUID {
 			closed_at = clock_timestamp(), delete_after = clock_timestamp() + interval '1 year', cost = 100
 		WHERE order_id = $1`, order.ID)
 	testdb.Exec(t, e.store, `UPDATE tasks SET status = 'COMPLETED', finished_at = clock_timestamp() WHERE order_id = $1`, order.ID)
-	err := e.store.InsertTask(context.Background(), order.ID, domain.TaskSettle,
-		domain.SettleParams{OperationID: order.ID.String(), UserID: "user", TotalAmount: 100}, time.Now(), nil)
+	ctx := t.Context()
+	now, err := e.store.Now(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = e.store.InsertTask(ctx, order.ID, domain.TaskSettle,
+		domain.SettleParams{OperationID: order.ID.String(), UserID: "user", TotalAmount: big.NewInt(100)}, now, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return order.ID
+}
+
+// Both candidates share a scheduling timestamp. The task ID breaks the tie
+// when the first page is locked.
+func TestSweepSkipsLockedTasks(t *testing.T) {
+	for _, kind := range []domain.TaskKind{domain.TaskStart, domain.TaskSettle} {
+		t.Run(string(kind), func(t *testing.T) {
+			e := newEnv(t)
+			e.worker.cfg.BatchSize = 1
+			for range 2 {
+				if kind == domain.TaskStart {
+					e.startingOrder(t, 250)
+				} else {
+					e.settleTask(t)
+				}
+			}
+			testdb.Exec(t, e.store, `UPDATE tasks SET attempt_count = $2, next_run_at = statement_timestamp()
+				WHERE task_type = $1`, kind, maxAttempts)
+			rows, err := e.store.Pool().Query(t.Context(), `SELECT task_id, order_id FROM tasks
+				WHERE task_type = $1 ORDER BY next_run_at, task_id`, kind)
+			if err != nil {
+				t.Fatal(err)
+			}
+			type taskRef struct{ ID, OrderID uuid.UUID }
+			tasks, err := pgx.CollectRows(rows, pgx.RowToStructByPos[taskRef])
+			if err != nil || len(tasks) != 2 {
+				t.Fatalf("prepare exhausted tasks: %v, %v", tasks, err)
+			}
+			locked, other := tasks[0], tasks[1]
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			// Hold the lock until the sweep has returned. Waiting for this task
+			// instead of skipping it would hit the context deadline.
+			err = e.store.InTx(ctx, func(q *storage.Queries) error {
+				if _, err := q.LockTask(ctx, locked.ID); err != nil {
+					return err
+				}
+				return e.worker.Sweep(ctx)
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := "DEAD_LETTER"
+			if kind == domain.TaskStart {
+				want = "COMPLETED"
+			}
+			blocked, _ := e.task(t, locked.OrderID, kind)
+			free, _ := e.task(t, other.OrderID, kind)
+			if blocked.Status != "PENDING" || free.Status != want || free.Attempts != maxAttempts {
+				t.Fatalf("after one sweep: locked %+v, other %+v, want PENDING and %s", blocked, free, want)
+			}
+			if kind == domain.TaskStart && str(free.Reason) != "MAX_ATTEMPTS_EXCEEDED" {
+				t.Fatalf("unexpected START reason: %+v", free)
+			}
+			if err := e.worker.Sweep(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if released, _ := e.task(t, locked.OrderID, kind); released.Status != want {
+				t.Fatalf("released %s: %+v", kind, released)
+			}
+		})
+	}
 }
 
 func TestSettle(t *testing.T) {
@@ -417,7 +689,8 @@ func TestSettle(t *testing.T) {
 			t.Fatalf("requeued task claimed %+v", claimed)
 		}
 		var params domain.SettleParams
-		if err := json.Unmarshal(claimed[0].Params, &params); err != nil || params.OperationID != id.String() || params.TotalAmount != 100 {
+		if err := json.Unmarshal(claimed[0].Params, &params); err != nil || params.OperationID != id.String() ||
+			params.TotalAmount == nil || params.TotalAmount.Cmp(big.NewInt(100)) != 0 {
 			t.Fatalf("requeue changed parameters: %+v %v", params, err)
 		}
 		if settle, _ := e.task(t, id, domain.TaskSettle); settle.Status != "COMPLETED" {
@@ -427,6 +700,7 @@ func TestSettle(t *testing.T) {
 
 	t.Run("exhausted transient failures go to DLQ", func(t *testing.T) {
 		e := newEnv(t)
+		log := e.captureLog()
 		e.payments.set(domain.TaskSettle, payment.Result{Outcome: payment.Transient, Detail: "timeout"})
 		id := e.settleTask(t)
 		for range maxAttempts {
@@ -439,9 +713,11 @@ func TestSettle(t *testing.T) {
 		if err := e.worker.Sweep(context.Background()); err != nil {
 			t.Fatal(err)
 		}
-		if settle, _ := e.task(t, id, domain.TaskSettle); settle.Status != "DEAD_LETTER" || settle.Attempts != maxAttempts {
+		if settle, _ := e.task(t, id, domain.TaskSettle); settle.Status != "DEAD_LETTER" ||
+			settle.Attempts != maxAttempts || str(settle.Error) != "timeout" {
 			t.Fatalf("SETTLE %+v", settle)
 		}
+		requireTaskLog(t, log, id, domain.TaskSettle, "DEAD_LETTER", "timeout")
 	})
 }
 
