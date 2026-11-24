@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -173,6 +174,7 @@ func TestPartitions(t *testing.T) {
 	if err := store.CreatePartition(ctx, replaced); err != nil {
 		t.Fatal(err)
 	}
+	insertArchivedOrder(t, store, replaced)
 	if err := store.SchedulePartitionDrop(ctx, replacement, replaced); err != nil {
 		t.Fatal(err)
 	}
@@ -211,7 +213,89 @@ func TestPartitions(t *testing.T) {
 	if n := count(t, store, "SELECT count(*) FROM history_partition_cleanup"); n != 0 {
 		t.Fatal("orphaned cleanup intents")
 	}
+	if n := count(t, store, "SELECT count(*) FROM order_history_locator"); n != 0 {
+		t.Fatal("orphaned locators")
+	}
 
+}
+
+// An unrelated leaf lock must not affect reads, even after repeated execution.
+func TestArchivedReadsPruneLockedPartitions(t *testing.T) {
+	store := testdb.New(t)
+	ctx := t.Context()
+	first := storage.WeekStart(time.Now()).AddDate(0, 0, 7)
+	for i := range 53 {
+		if err := store.CreatePartition(ctx, first.AddDate(0, 0, i*7)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	id := insertArchivedOrder(t, store, first)
+	order, err := store.GetArchivedOrder(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	locker, err := store.Pool().Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer locker.Rollback(context.Background())
+	name := pgx.Identifier{storage.PartitionName(first.AddDate(0, 0, 7))}.Sanitize()
+	if _, err := locker.Exec(ctx, "LOCK TABLE ONLY "+name+" IN ACCESS EXCLUSIVE MODE"); err != nil {
+		t.Fatal(err)
+	}
+	for range 8 {
+		readCtx, cancel := context.WithTimeout(ctx, time.Second)
+		got, archived, _, err := store.GetOrder(readCtx, id)
+		cancel()
+		if err != nil || !archived || got.ID != id {
+			t.Fatalf("archived read: archived=%t order=%v err=%v", archived, got.ID, err)
+		}
+		readCtx, cancel = context.WithTimeout(ctx, time.Second)
+		ref, err := store.FindOrderByOffer(readCtx, order.OfferID)
+		cancel()
+		if err != nil || ref.ID != id {
+			t.Fatalf("archived replay: order=%v err=%v", ref.ID, err)
+		}
+	}
+}
+
+func TestPartitionLocatorCleanupResumesAcrossCycles(t *testing.T) {
+	store := testdb.New(t)
+	ctx := t.Context()
+	m := newMaintenance(t, store)
+	m.cfg.BatchSize = 1
+	week := storage.WeekStart(time.Now()).AddDate(0, 0, -14)
+	if err := store.CreatePartition(ctx, week); err != nil {
+		t.Fatal(err)
+	}
+	var old uuid.UUID
+	for range 10 {
+		old = insertArchivedOrder(t, store, week)
+	}
+	if err := m.RunCycle(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.GetArchivedOrder(ctx, old); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("detached history remains readable: %v", err)
+	}
+	if left := count(t, store, "SELECT count(*) FROM order_history_locator"); left != 2 {
+		t.Fatalf("expected two locators left for the next cycle, got %d", left)
+	}
+	if n := count(t, store, "SELECT count(*) FROM history_partition_cleanup"); n != 1 {
+		t.Fatal("detached partition missing from cleanup journal")
+	}
+	if err := m.RunCycle(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if left := count(t, store, "SELECT count(*) FROM order_history_locator"); left != 0 {
+		t.Fatalf("%d locators survived cleanup", left)
+	}
+	if n := count(t, store, "SELECT count(*) FROM history_partition_cleanup"); n != 0 {
+		t.Fatal("completed cleanup still in journal")
+	}
+	if n := count(t, store, "SELECT num_nonnulls(to_regclass($1))", storage.PartitionName(week)); n != 0 {
+		t.Fatal("detached table survived cleanup")
+	}
 }
 
 func TestPartitionOnDemand(t *testing.T) {

@@ -72,7 +72,7 @@ func newOrderEnv(t *testing.T) *orderEnv {
 		return domain.UserProfile{UserID: id}, nil
 	})
 	env.offers = NewOfferService(store, env.scooters, tariffs, profiles, configs, 2*time.Minute)
-	env.orders = NewOrderService(store, env.scooters, configs, 2*time.Minute, time.Hour)
+	env.orders = NewOrderService(store, env.scooters, configs, 2*time.Minute, time.Hour, nil)
 	return env
 }
 

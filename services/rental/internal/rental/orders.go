@@ -14,16 +14,23 @@ import (
 	"github.com/dkoptev06/sd-hw1-team4/services/rental/internal/storage"
 )
 
+// OrderReader provides the GET view with the time used to calculate its cost.
+type OrderReader func(context.Context, uuid.UUID) (domain.Order, bool, time.Time, error)
+
 type OrderService struct {
 	store     *storage.Store
+	read      OrderReader
 	scooters  Scooters
 	configs   Configs
 	startTTL  time.Duration
 	holdGrace time.Duration
 }
 
-func NewOrderService(store *storage.Store, scooters Scooters, configs Configs, startTTL, holdGrace time.Duration) *OrderService {
-	return &OrderService{store: store, scooters: scooters, configs: configs, startTTL: startTTL, holdGrace: holdGrace}
+func NewOrderService(store *storage.Store, scooters Scooters, configs Configs, startTTL, holdGrace time.Duration, read OrderReader) *OrderService {
+	if read == nil {
+		read = store.GetOrder
+	}
+	return &OrderService{store: store, read: read, scooters: scooters, configs: configs, startTTL: startTTL, holdGrace: holdGrace}
 }
 
 // StartResult is the answer to POST /orders.
@@ -160,7 +167,7 @@ type OrderView struct {
 
 // Get reads a current or archived order and calculates the cost of an active trip.
 func (s *OrderService) Get(ctx context.Context, orderID uuid.UUID) (OrderView, error) {
-	order, archived, now, err := s.store.GetOrder(ctx, orderID)
+	order, archived, now, err := s.read(ctx, orderID)
 	if errors.Is(err, storage.ErrNotFound) {
 		return OrderView{}, domain.Wrap(domain.ErrNotFound, "order %s not found", orderID)
 	}

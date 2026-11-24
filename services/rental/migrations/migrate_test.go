@@ -86,6 +86,15 @@ func TestUpgradeOrderCosts(t *testing.T) {
 	if err := Up(ctx, db); err != nil {
 		t.Fatalf("upgrade version 2: %v", err)
 	}
+	var located bool
+	err = db.QueryRowContext(ctx, `
+		SELECT EXISTS (SELECT 1 FROM orders_history h JOIN order_history_locator l
+			ON (l.order_id, l.offer_id, l.delete_after, l.partition_oid) =
+			   (h.order_id, h.offer_id, h.delete_after, h.tableoid::regclass))
+	`).Scan(&located)
+	if err != nil || !located {
+		t.Fatalf("historical order locator missing after upgrade: %t, %v", located, err)
+	}
 	var currentByte, archivedByte int
 	err = db.QueryRowContext(ctx, `
 		SELECT (SELECT get_byte(payload, 0) FROM orders),

@@ -19,6 +19,7 @@ import (
 	"github.com/dkoptev06/sd-hw1-team4/services/rental/internal/httpjson"
 	"github.com/dkoptev06/sd-hw1-team4/services/rental/internal/httpserver"
 	"github.com/dkoptev06/sd-hw1-team4/services/rental/internal/maintenance"
+	"github.com/dkoptev06/sd-hw1-team4/services/rental/internal/ordercache"
 	"github.com/dkoptev06/sd-hw1-team4/services/rental/internal/payment"
 	"github.com/dkoptev06/sd-hw1-team4/services/rental/internal/rental"
 	"github.com/dkoptev06/sd-hw1-team4/services/rental/internal/settings"
@@ -84,8 +85,28 @@ func runAPI(ctx context.Context, cfg settings.Settings, store *storage.Store, lo
 		return err
 	}
 
+	// Reserve pool capacity for the write endpoints and readiness checks.
+	cacheCfg := cfg.OrderCache
+	cacheCfg.DBMaxConcurrency = min(cacheCfg.DBMaxConcurrency, max(1, int(cfg.DBMaxConns)-1))
+	cacheCfg.DBDegradedConcurrency = min(cacheCfg.DBDegradedConcurrency, cacheCfg.DBMaxConcurrency)
+	var remote ordercache.RemoteCache
+	if cacheCfg.RedisURL != "" {
+		remote, err = ordercache.NewRedisClient(cacheCfg.RedisURL, cacheCfg.RedisPoolSize, cacheCfg.RedisTimeout)
+		if err != nil {
+			return err
+		}
+	}
+	cache, err := ordercache.New(cacheCfg, remote, store.GetOrder, time.Now)
+	if err != nil {
+		if remote != nil {
+			_ = remote.Close()
+		}
+		return err
+	}
+	defer cache.Close()
+
 	offers := rental.NewOfferService(store, sourceClient, tariffs, sourceClient, configs, cfg.OfferTTL)
-	orders := rental.NewOrderService(store, sourceClient, configs, cfg.StartTTL, cfg.HoldGrace)
+	orders := rental.NewOrderService(store, sourceClient, configs, cfg.StartTTL, cfg.HoldGrace, cache.Get)
 	router := httpapi.NewRouter(httpapi.NewAPI(offers, orders), store.Ping, log)
 	log.Info("serving API", "addr", cfg.HTTPAddr)
 	return httpserver.Start(ctx, cfg.HTTPAddr, router)

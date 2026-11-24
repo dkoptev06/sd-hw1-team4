@@ -42,6 +42,11 @@ services:
     volumes:
       - postgres-data:/var/lib/postgresql/data
 
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru"]
+    restart: unless-stopped
+
   migrate:
     image: *rental-image
     pull_policy: never
@@ -55,9 +60,20 @@ services:
     <<: *rental
     build: ./services/rental
     command: ["api"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      source:
+        condition: service_healthy
+      payment:
+        condition: service_healthy
+      redis:
+        condition: service_started
+        required: false
     environment:
       <<: *rental-env
       RENTAL_DB_MAX_CONNS: "40"
+      REDIS_URL: redis://redis:6379
     deploy:
       replicas: ${RENTAL_API_REPLICAS:-2}
 

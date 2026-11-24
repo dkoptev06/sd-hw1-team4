@@ -69,6 +69,7 @@ var statusByCode = map[domain.Code]int{
 	domain.CodeOrderNotActive:    http.StatusConflict,
 	domain.CodeSourceUnavailable: http.StatusServiceUnavailable,
 	domain.CodeZoneStale:         http.StatusServiceUnavailable,
+	domain.CodeOverloaded:        http.StatusServiceUnavailable,
 }
 
 // write sends the error response and returns its error code.

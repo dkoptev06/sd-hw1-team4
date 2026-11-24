@@ -10,6 +10,7 @@ Rental выдаёт офферы и ведёт заказы в PostgreSQL. Sourc
 | `rental worker` | Задачи START, SETTLE и VOID из таблицы `tasks`: захват с lease, повторы с backoff, DLQ |
 | `rental maintenance` | Удаление выполненных задач, перенос заказов в `orders_history`, очистка офферов и недельных разделов; одна активная реплика по lease |
 | `rental migrate` | Миграции схемы |
+| `redis` | Общий кэш архивных GET для реплик Rental API |
 | `rental dlq list` / `rental dlq requeue <task_id>\|--all` | Просмотр DLQ и ручной возврат задач |
 | `source`, `payment` | Заглушки по контракту, данные в памяти |
 
@@ -26,6 +27,7 @@ services/rental/internal/
   maintenance/  архивация, очистка, разделы, метрики состояния БД
   httpapi/      HTTP-обработчики и коды ошибок
   source/       клиент Source и LRU-кэш тарифных зон
+  ordercache/   кэш архивных заказов и ограничение чтений из PostgreSQL
   payment/      клиент Payment
   dynconfig/    снимок /configs: обновление раз в минуту, дефолты на холодном старте
   settings/     настройки процесса из переменных окружения
@@ -90,6 +92,10 @@ docker run --rm --entrypoint /bin/promtool -v "$PWD/deploy/prometheus:/rules:ro"
 | `SOURCE_URL`, `PAYMENT_URL` | `http://source:8080`, `http://payment:8080` | Адреса зависимостей |
 | `SOURCE_TIMEOUT`, `PAYMENT_TIMEOUT` | `500ms`, `3s` | Таймауты вызовов |
 | `RENTAL_DB_MAX_CONNS` | `20` | Размер пула соединений процесса |
+| `REDIS_URL` | пусто, в Compose `redis://redis:6379` | Адрес общего кэша. Без адреса работает локальный LRU |
+| `ORDER_CACHE_SIZE`, `ORDER_CACHE_TTL` | `65536`, `1m` | Максимум архивных записей в LRU на реплику и базовый TTL |
+| `ORDER_CACHE_REDIS_POOL_SIZE`, `ORDER_CACHE_REDIS_TIMEOUT`, `ORDER_CACHE_REDIS_COOLDOWN` | `64`, `50ms`, `5s` | Соединения Redis, таймаут операции и пауза перед пробой после сбоя |
+| `ORDER_READ_DB_MAX_CONCURRENCY`, `ORDER_READ_DEGRADED_CONCURRENCY`, `ORDER_READ_DB_WAIT` | `24`, `12`, `250ms` | Лимиты параллельных GET в PostgreSQL на реплику и время ожидания слота |
 | `WORKER_CONCURRENCY`, `WORKER_POLL_INTERVAL` | `64`, `100ms` | Параллелизм и опрос очереди |
 | `START_MAX_ATTEMPTS`, `SETTLE_MAX_ATTEMPTS`, `VOID_MAX_ATTEMPTS` | `5`, `20`, `20` | Лимиты попыток |
 | `MAINTENANCE_INTERVAL`, `MAINTENANCE_BATCH_SIZE` | `1m`, `2000` | Период и размер пачки обслуживания |

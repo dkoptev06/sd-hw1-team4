@@ -52,16 +52,24 @@ type OrderRef struct {
 	Status domain.OrderStatus
 }
 
-// FindOrderByOffer reads the current order or its archived record in one snapshot.
+// FindOrderByOffer reads the current order or its archived record using the
+// partition-pruned history locator so live starts never scan all history partitions.
 func (q *Queries) FindOrderByOffer(ctx context.Context, offerID uuid.UUID) (OrderRef, error) {
-	// Archiving removes the offer together with its order. Skip history for live offers.
 	var ref OrderRef
-	err := q.db.QueryRow(ctx, `
-		SELECT order_id, status FROM orders WHERE offer_id = $1
-		UNION ALL
-		SELECT order_id, status FROM orders_history
-		WHERE offer_id = $1 AND NOT EXISTS (SELECT 1 FROM offers WHERE offer_id = $1)
-		LIMIT 1`, offerID).Scan(&ref.ID, &ref.Status)
+	err := q.db.QueryRow(ctx, `SELECT order_id, status FROM orders WHERE offer_id = $1`, offerID).Scan(&ref.ID, &ref.Status)
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return ref, notFound(err)
+	}
+	var orderID uuid.UUID
+	var deleteAfter time.Time
+	err = q.db.QueryRow(ctx,
+		`SELECT order_id, delete_after FROM order_history_locator WHERE offer_id = $1`, offerID).Scan(&orderID, &deleteAfter)
+	if err != nil {
+		return OrderRef{}, notFound(err)
+	}
+	err = q.db.QueryRow(ctx,
+		`SELECT order_id, status`+historyByID,
+		pgx.QueryExecModeExec, orderID, deleteAfter).Scan(&ref.ID, &ref.Status)
 	return ref, notFound(err)
 }
 
@@ -101,21 +109,40 @@ func (q *Queries) InsertOrder(ctx context.Context, o domain.Order) error {
 	return err
 }
 
-// GetOrder reads a current order, falling back to the history, together with the database time.
-func (q *Queries) GetOrder(ctx context.Context, id uuid.UUID) (order domain.Order, archived bool, now time.Time, err error) {
-	order, err = scanOrder(q.db.QueryRow(ctx,
-		`SELECT `+orderReadColumns+`, clock_timestamp() FROM orders WHERE order_id = $1`, id), &now)
-	if errors.Is(err, ErrNotFound) {
-		archived = true
-		order, err = scanOrder(q.db.QueryRow(ctx,
-			`SELECT `+orderReadColumns+`, clock_timestamp() FROM orders_history WHERE order_id = $1`, id), &now)
-	}
-	return order, archived, now.UTC(), err
+// Use a custom plan with the bound partition key. A cached generic plan can
+// lock partitions before pruning them at execution time.
+const historyByID = ` FROM orders_history WHERE order_id = $1 AND delete_after = $2`
+
+func (q *Queries) historyDeadline(ctx context.Context, id uuid.UUID) (time.Time, error) {
+	var deadline time.Time
+	err := q.db.QueryRow(ctx, `SELECT delete_after FROM order_history_locator WHERE order_id = $1`, id).Scan(&deadline)
+	return deadline, notFound(err)
 }
 
-// GetArchivedOrder reads an order from the history.
+// GetOrder reads current before history so concurrent archiving stays visible.
+func (q *Queries) GetOrder(ctx context.Context, id uuid.UUID) (domain.Order, bool, time.Time, error) {
+	var now time.Time
+	order, err := scanOrder(q.db.QueryRow(ctx,
+		`SELECT `+orderReadColumns+`, clock_timestamp() FROM orders WHERE order_id = $1`, id), &now)
+	if !errors.Is(err, ErrNotFound) {
+		return order, false, now.UTC(), err
+	}
+	deadline, err := q.historyDeadline(ctx, id)
+	if err != nil {
+		return domain.Order{}, false, time.Time{}, err
+	}
+	order, err = scanOrder(q.db.QueryRow(ctx, `SELECT `+orderReadColumns+`, clock_timestamp()`+historyByID,
+		pgx.QueryExecModeExec, id, deadline), &now)
+	return order, true, now.UTC(), err
+}
+
+// GetArchivedOrder reads an order from a single pruned history partition.
 func (q *Queries) GetArchivedOrder(ctx context.Context, id uuid.UUID) (domain.Order, error) {
-	return scanOrder(q.db.QueryRow(ctx, `SELECT `+orderReadColumns+` FROM orders_history WHERE order_id = $1`, id))
+	deadline, err := q.historyDeadline(ctx, id)
+	if err != nil {
+		return domain.Order{}, err
+	}
+	return scanOrder(q.db.QueryRow(ctx, `SELECT `+orderReadColumns+historyByID, pgx.QueryExecModeExec, id, deadline))
 }
 
 // LockOrder reads and locks a current order.

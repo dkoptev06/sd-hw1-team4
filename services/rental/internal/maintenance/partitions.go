@@ -133,13 +133,19 @@ func (m *Maintenance) applyDrops(ctx context.Context, q *storage.Queries, drops 
 		if err != nil {
 			return fmt.Errorf("detach %s: %w", p.Name, err)
 		}
-		dropped, err := q.FinishPartitionDrop(ctx, p)
-		if err != nil {
-			return err
-		}
-		if dropped {
-			metrics.MaintenanceRows.WithLabelValues("drop_partitions").Inc()
-			m.log.Info("dropped expired history partition", "partition", p.Name)
+		// Keep locator WAL and lock time bounded per transaction and per cycle.
+		for range 8 {
+			dropped, more, err := q.FinishPartitionDrop(ctx, p, m.cfg.BatchSize)
+			if err != nil {
+				return err
+			}
+			if dropped {
+				metrics.MaintenanceRows.WithLabelValues("drop_partitions").Inc()
+				m.log.Info("dropped expired history partition", "partition", p.Name)
+			}
+			if !more {
+				break
+			}
 		}
 	}
 	return nil

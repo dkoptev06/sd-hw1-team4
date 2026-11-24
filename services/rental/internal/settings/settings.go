@@ -29,8 +29,21 @@ type Settings struct {
 	StartTTL  time.Duration
 	HoldGrace time.Duration
 
+	OrderCache  OrderCache
 	Worker      Worker
 	Maintenance Maintenance
+}
+
+type OrderCache struct {
+	RedisURL              string
+	Size                  int
+	TTL                   time.Duration
+	RedisTimeout          time.Duration
+	RedisCooldown         time.Duration
+	RedisPoolSize         int
+	DBMaxConcurrency      int
+	DBDegradedConcurrency int
+	DBWaitTimeout         time.Duration
 }
 
 type Worker struct {
@@ -75,6 +88,18 @@ func Load() (Settings, error) {
 		StartTTL:  e.dur("START_TTL", 2*time.Minute),
 		HoldGrace: e.dur("HOLD_GRACE", time.Hour),
 
+		OrderCache: OrderCache{
+			RedisURL:              e.str("REDIS_URL", ""),
+			Size:                  e.int("ORDER_CACHE_SIZE", 65_536),
+			TTL:                   e.dur("ORDER_CACHE_TTL", time.Minute),
+			RedisTimeout:          e.dur("ORDER_CACHE_REDIS_TIMEOUT", 50*time.Millisecond),
+			RedisCooldown:         e.dur("ORDER_CACHE_REDIS_COOLDOWN", 5*time.Second),
+			RedisPoolSize:         e.int("ORDER_CACHE_REDIS_POOL_SIZE", 64),
+			DBMaxConcurrency:      e.int("ORDER_READ_DB_MAX_CONCURRENCY", 24),
+			DBDegradedConcurrency: e.int("ORDER_READ_DEGRADED_CONCURRENCY", 12),
+			DBWaitTimeout:         e.dur("ORDER_READ_DB_WAIT", 250*time.Millisecond),
+		},
+
 		Worker: Worker{
 			Concurrency:     e.int("WORKER_CONCURRENCY", 64),
 			BatchSize:       e.int("WORKER_BATCH_SIZE", 32),
@@ -104,7 +129,10 @@ func Load() (Settings, error) {
 	}
 	for name, v := range map[string]int{
 		"RENTAL_DB_MAX_CONNS": int(s.DBMaxConns), "TARIFF_CACHE_SIZE": s.TariffCacheSize,
-		"WORKER_CONCURRENCY": s.Worker.Concurrency, "WORKER_BATCH_SIZE": s.Worker.BatchSize,
+		"ORDER_CACHE_SIZE": s.OrderCache.Size, "ORDER_CACHE_REDIS_POOL_SIZE": s.OrderCache.RedisPoolSize,
+		"ORDER_READ_DB_MAX_CONCURRENCY":   s.OrderCache.DBMaxConcurrency,
+		"ORDER_READ_DEGRADED_CONCURRENCY": s.OrderCache.DBDegradedConcurrency,
+		"WORKER_CONCURRENCY":              s.Worker.Concurrency, "WORKER_BATCH_SIZE": s.Worker.BatchSize,
 		"MAINTENANCE_BATCH_SIZE": s.Maintenance.BatchSize, "MAINTENANCE_PARTITION_WEEKS_AHEAD": s.Maintenance.WeeksAhead,
 	} {
 		if v <= 0 {

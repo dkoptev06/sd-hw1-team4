@@ -26,6 +26,22 @@ var (
 		Namespace: namespace, Name: "order_read_duration_seconds", Help: "GET /orders/{id} latency by storage.",
 		Buckets: latencyBuckets,
 	}, []string{"storage"})
+	// OrderCache metrics track L1/Redis hit rates and DB anti-amplification protection.
+	OrderCacheLookups = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace, Name: "order_cache_lookups_total", Help: "Order cache lookups by layer and result.",
+	}, []string{"layer", "result"})
+	OrderCacheCoalesced = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace, Name: "order_cache_coalesced_total", Help: "Order reads served by a shared cache lookup or PostgreSQL load.",
+	})
+	OrderReadShed = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace, Name: "order_read_shed_total", Help: "Order reads shed by the DB fallback bulkhead during overload or cache outage.",
+	})
+	OrderCacheRedisCircuitOpen = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: namespace, Name: "order_cache_redis_circuit_open", Help: "1 while the Redis cache circuit breaker is open.",
+	})
+	OrderReadDBInflight = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: namespace, Name: "order_read_db_inflight", Help: "Concurrent fallback order reads executing against PostgreSQL.",
+	})
 
 	// DependencyCalls counts Source and Payment calls by dependency, operation and outcome.
 	DependencyCalls = promauto.NewCounterVec(prometheus.CounterOpts{

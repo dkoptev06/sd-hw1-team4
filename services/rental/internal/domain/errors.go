@@ -16,6 +16,7 @@ const (
 	CodeOrderNotActive    Code = "ORDER_NOT_ACTIVE"
 	CodeSourceUnavailable Code = "SOURCE_UNAVAILABLE"
 	CodeZoneStale         Code = "ZONE_STALE"
+	CodeOverloaded        Code = "OVERLOADED"
 )
 
 // Error is a business error that maps to a client response.
@@ -41,6 +42,7 @@ var (
 	ErrOrderNotActive    = &Error{Code: CodeOrderNotActive}
 	ErrSourceUnavailable = &Error{Code: CodeSourceUnavailable}
 	ErrZoneStale         = &Error{Code: CodeZoneStale}
+	ErrOverloaded        = &Error{Code: CodeOverloaded}
 )
 
 // Wrap attaches a detail to a business error while keeping errors.Is/As working.

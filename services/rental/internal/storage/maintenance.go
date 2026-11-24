@@ -311,17 +311,55 @@ func (q *Queries) FinalizeDetach(ctx context.Context, name string) error {
 	return err
 }
 
-// FinishPartitionDrop checks the identity again under the DDL lock. A replacement
-// table with the same name must survive, even if a previous cleanup was interrupted.
-func (q *Queries) FinishPartitionDrop(ctx context.Context, p PartitionDrop) (bool, error) {
-	var dropped bool
+// FinishPartitionDrop deletes a bounded locator batch. The detached table and
+// journal entry remain available for retries until the last batch commits.
+func (q *Queries) FinishPartitionDrop(ctx context.Context, p PartitionDrop, limit int) (dropped, more bool, err error) {
 	name := pgx.Identifier{p.Name}.Sanitize()
-	err := pgx.BeginFunc(ctx, q.db, func(tx pgx.Tx) error {
+	err = pgx.BeginFunc(ctx, q.db, func(tx pgx.Tx) error {
 		const matches = `SELECT EXISTS (SELECT 1 FROM pg_class
 			WHERE oid = $1 AND oid = to_regclass($2) AND NOT relispartition AND relkind = 'r')`
-		var same bool
+		var same, missing bool
 		if err := tx.QueryRow(ctx, matches, p.OID, name).Scan(&same); err != nil {
 			return err
+		}
+		if !same {
+			// An externally removed table can leave locators behind. A renamed
+			// or replacement relation is never dropped on the journal's authority.
+			if err := tx.QueryRow(ctx, `SELECT NOT EXISTS (SELECT 1 FROM pg_class WHERE oid=$1)`, p.OID).Scan(&missing); err != nil {
+				return err
+			}
+		}
+		if same || missing {
+			var cursor *uuid.UUID
+			if err := tx.QueryRow(ctx, `
+				SELECT locator_cursor FROM history_partition_cleanup WHERE partition_oid=$1`, p.OID).Scan(&cursor); err != nil {
+				return err
+			}
+			const byPartition = `SELECT order_id FROM order_history_locator WHERE partition_oid = $1::oid::regclass`
+			batch := byPartition
+			args := []any{p.OID, limit}
+			if cursor != nil {
+				batch += ` AND order_id > $3`
+				args = append(args, *cursor)
+			}
+			// Advance past deleted index entries even if vacuum has not removed them yet.
+			var deleted int
+			var last *uuid.UUID
+			err := tx.QueryRow(ctx, `
+				WITH batch AS MATERIALIZED (`+batch+` ORDER BY order_id LIMIT $2),
+				deleted AS (
+					DELETE FROM order_history_locator l USING batch b WHERE l.order_id=b.order_id RETURNING l.order_id
+				)
+				SELECT (SELECT count(*) FROM deleted), (SELECT order_id FROM batch ORDER BY order_id DESC LIMIT 1)`,
+				args...).Scan(&deleted, &last)
+			if err != nil {
+				return err
+			}
+			if deleted == limit {
+				more = true
+				_, err := tx.Exec(ctx, `UPDATE history_partition_cleanup SET locator_cursor=$2 WHERE partition_oid=$1`, p.OID, last)
+				return err
+			}
 		}
 		if same {
 			if _, err := tx.Exec(ctx, "LOCK TABLE ONLY "+name+" IN ACCESS EXCLUSIVE MODE"); err != nil {
@@ -340,7 +378,7 @@ func (q *Queries) FinishPartitionDrop(ctx context.Context, p PartitionDrop) (boo
 		_, err := tx.Exec(ctx, `DELETE FROM history_partition_cleanup WHERE partition_oid=$1`, p.OID)
 		return err
 	})
-	return dropped, err
+	return dropped, more, err
 }
 
 // WithLockTimeout lets a one-connection pool serve archive work between DDL retries.
