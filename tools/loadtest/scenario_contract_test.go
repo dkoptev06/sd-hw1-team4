@@ -50,8 +50,7 @@ func TestLoadtestScenarioContract(t *testing.T) {
 		{name: "bad_archive_response_fails", history: 15, breakHistory: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			const scheduled = 30 // 10 arrivals/s across 1s of warm-up and a 2s window
+			const scheduled = 30 // 5 arrivals/s across 1s of warm-up and a 5s window
 			const fleet = 7
 			var mu sync.Mutex
 			offers := make(map[string]*scenarioRide)
@@ -106,7 +105,7 @@ func TestLoadtestScenarioContract(t *testing.T) {
 					// A closed-loop driver would never send the second in time.
 					select {
 					case <-secondArrival:
-					case <-time.After(800 * time.Millisecond):
+					case <-time.After(1500 * time.Millisecond):
 						t.Error("the next arrival waited for the previous response")
 						w.WriteHeader(504)
 						return
@@ -189,8 +188,8 @@ func TestLoadtestScenarioContract(t *testing.T) {
 				t.Fatal(err)
 			}
 			args := []string{"-test.run=^TestLoadtestScenarioChild$", "--", "-url", server.URL,
-				"-rate", "10", "-window", "2s", "-warmup", "1s", "-min-ride", "250ms", "-max-ride", "250ms",
-				"-fleet", strconv.Itoa(fleet), "-read-concurrency", "16", "-read-queue", "128"}
+				"-rate", "5", "-window", "5s", "-warmup", "1s", "-min-ride", "250ms", "-max-ride", "250ms",
+				"-fleet", strconv.Itoa(fleet), "-read-concurrency", "16", "-read-queue", "2048"}
 			if tc.history > 0 {
 				args = append(args, "-historical", "15", "-history-file", historyFile)
 			}

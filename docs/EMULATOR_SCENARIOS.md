@@ -2,6 +2,8 @@
 
 Эмулятор работает с HTTP-контрактом основной ветки `origin/master` на коммите `a607276`. Ядро Rental, Source, Payment, миграции и основной `compose.yaml` берутся из этой ветки. [Контракт зависимостей](EXTERNAL_SERVICES.md) · [План испытаний](TEST_PLAN.md)
 
+Код эмулятора, его Go-модуль, Dockerfile и вспомогательные скрипты находятся в [tools/loadtest](../tools/loadtest). Сервис эмулятора подключается к сети приложения через отдельный [Compose-файл](../compose.loadtest.yaml).
+
 | Сценарий | Запросы | Исходные данные |
 | --- | --- | --- |
 | Базовый | 100 новых поездок в секунду и 50 GET своего заказа на поездку | Пустая БД Rental, стандартный Source с 40 000 самокатов и пользователей |
@@ -14,7 +16,7 @@
 ## Проверка логики отдельно от стенда
 
 ```sh
-go test -race ./services/rental/cmd/loadtest
+(cd tools/loadtest && GOWORK=off go test -race ./...)
 ```
 
 Автотесты запускают CLI и проверяют счётчики HTTP на тестовом сервере. Базовый сценарий создаёт 30 поездок с 1 500 текущими GET. Смешанный создаёт 30 поездок с 1 050 текущими и 450 архивными GET. Отдельная проверка возвращает 503 на архивный GET и требует, чтобы все 450 ошибок попали в JSON, а CLI вернул код 1.
@@ -28,9 +30,9 @@ go test -race ./services/rental/cmd/loadtest
 ```sh
 export COMPOSE_PROJECT_NAME=baseline-lab
 make up
-python3 scripts/prepare-emulator-data.py baseline --project "$COMPOSE_PROJECT_NAME"
-python3 scripts/run-profile.py --out build/baseline.json
-python3 scripts/check-profile-payments.py build/baseline.json > build/baseline-payments.json
+python3 tools/loadtest/scripts/prepare-emulator-data.py baseline --project "$COMPOSE_PROJECT_NAME"
+python3 tools/loadtest/scripts/run-profile.py --out build/baseline.json
+python3 tools/loadtest/scripts/check-profile-payments.py build/baseline.json > build/baseline-payments.json
 ```
 
 **Смешанный профиль**
@@ -38,17 +40,17 @@ python3 scripts/check-profile-payments.py build/baseline.json > build/baseline-p
 ```sh
 export COMPOSE_PROJECT_NAME=mixed-lab
 docker compose up -d --build --wait nginx rental-worker prometheus
-python3 scripts/prepare-emulator-data.py mixed --project "$COMPOSE_PROJECT_NAME" \
+python3 tools/loadtest/scripts/prepare-emulator-data.py mixed --project "$COMPOSE_PROJECT_NAME" \
   --ids build/mixed-history.ids --expired-count 12000
 docker compose up -d --wait rental-maintenance
-python3 scripts/run-profile.py --out build/mixed.json \
+python3 tools/loadtest/scripts/run-profile.py --out build/mixed.json \
   --history-file build/mixed-history.ids -- -historical 15
-python3 scripts/check-profile-payments.py build/mixed.json > build/mixed-payments.json
+python3 tools/loadtest/scripts/check-profile-payments.py build/mixed.json > build/mixed-payments.json
 ```
 
 Если проекты используют одинаковые хостовые порты, остановите базовый проект своим `docker compose stop` до запуска смешанного. Опция `--expired-count 12000` показывает проверяемый пример генерации, по умолчанию она равна нулю. Maintenance может удалить этот раздел до начала измерения. До и после прогона сравните состояние БД и счётчик `rental_maintenance_rows_total{step="drop_partitions"}`.
 
-Модуль [run-profile.py](../scripts/run-profile.py) запускает отдельный контейнер эмулятора через [Compose дополнение](../compose.loadtest.yaml), ждёт обработки задач и сверяет PostgreSQL с JSON. Для уже собранного образа можно передать `--no-build`. В полном запуске Payment проверяется выборкой по 1 000 завершённых поездок. Для короткой проверки уменьшите её флагом `--sample-size`. Для графиков используйте [export-window.py](../scripts/export-window.py) и адрес Prometheus выбранного проекта.
+Модуль [run-profile.py](../tools/loadtest/scripts/run-profile.py) запускает отдельный контейнер эмулятора через [Compose дополнение](../compose.loadtest.yaml), ждёт обработки задач и сверяет PostgreSQL с JSON. Для уже собранного образа можно передать `--no-build`. В полном запуске Payment проверяется выборкой по 1 000 завершённых поездок. Для короткой проверки уменьшите её флагом `--sample-size`. Для графиков используйте [export-window.py](../tools/loadtest/scripts/export-window.py) и адрес Prometheus выбранного проекта.
 
 ## Проверка совместимости с `a607276`
 

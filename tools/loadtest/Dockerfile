@@ -2,8 +2,8 @@ FROM golang:1.26-alpine AS build
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
-COPY cmd/loadtest/ ./cmd/loadtest/
-RUN CGO_ENABLED=0 go build -trimpath -o /loadtest ./cmd/loadtest
+COPY *.go ./
+RUN CGO_ENABLED=0 go build -trimpath -o /loadtest .
 
 FROM scratch
 COPY --from=build /loadtest /usr/local/bin/loadtest

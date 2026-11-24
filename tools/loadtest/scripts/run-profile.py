@@ -9,7 +9,8 @@ import tempfile
 import time
 from datetime import datetime, timezone
 
-ROOT = Path(__file__).resolve().parents[1]
+SCRIPT_DIR = Path(__file__).resolve().parent
+ROOT = SCRIPT_DIR.parents[2]
 COMPOSE = ["docker", "compose", "-f", "compose.yaml", "-f", "compose.loadtest.yaml", "--profile", "loadtest"]
 
 
@@ -128,7 +129,7 @@ def main():
             break
         time.sleep(2)
     end = datetime.now(timezone.utc)
-    summary = json.loads(sql((ROOT / "scripts/check-profile.sql").read_text(), {
+    summary = json.loads(sql((SCRIPT_DIR / "check-profile.sql").read_text(), {
         "run_start": result["start"], "run_end": end.isoformat(),
         "win_from": result["window_from"], "win_to": result["window_to"],
     }))

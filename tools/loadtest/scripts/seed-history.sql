@@ -1,5 +1,5 @@
 -- Generate historical GET targets in an isolated, migrated acceptance database.
--- psql -XqAt -v rows=53000 -v expired=12000 < scripts/seed-history.sql > build/history.ids
+-- psql -XqAt -v rows=53000 -v expired=12000 < tools/loadtest/scripts/seed-history.sql > build/history.ids
 -- Only retained UUIDs go to stdout. The optional second cohort already expired
 -- in a completed UTC week so the service can detach and drop its whole partition.
 \set ON_ERROR_STOP on

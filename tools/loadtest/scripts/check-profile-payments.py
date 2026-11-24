@@ -11,7 +11,7 @@ import sys
 from urllib.parse import urlsplit
 from uuid import UUID
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[3]
 SAMPLE_SQL = """
 WITH cohort AS (
     SELECT order_id, status FROM orders
@@ -91,7 +91,7 @@ def verify(path, sample_size):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("profiles", type=Path, nargs="+", help="JSON output from scripts/run-profile.py")
+    parser.add_argument("profiles", type=Path, nargs="+", help="JSON output from run-profile.py")
     parser.add_argument("--sample-size", type=int, default=1000, help="distinct order IDs per profile (default 1000)")
     args = parser.parse_args()
     if args.sample_size < 1:

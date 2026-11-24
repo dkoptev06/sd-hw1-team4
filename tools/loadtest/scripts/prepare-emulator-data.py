@@ -8,7 +8,8 @@ import sys
 from pathlib import Path
 from uuid import UUID
 
-ROOT = Path(__file__).resolve().parents[1]
+SCRIPT_DIR = Path(__file__).resolve().parent
+ROOT = SCRIPT_DIR.parents[2]
 
 EMPTY = """
 SELECT NOT EXISTS (SELECT FROM orders) AND NOT EXISTS (SELECT FROM orders_history)
@@ -55,7 +56,7 @@ def prepare(args):
     if args.profile == "baseline":
         return manifest
 
-    printed = psql(args.project, (ROOT / "scripts/seed-history.sql").read_text(), {
+    printed = psql(args.project, (SCRIPT_DIR / "seed-history.sql").read_text(), {
         "rows": args.history_count,
         "expired": args.expired_count,
     }).split()
